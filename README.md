@@ -90,18 +90,27 @@ Also try: block any road from the toolbar, the 3 route scenarios on *Resources &
 
 ResQGrid is production-ready and can be deployed as a **single unified web service** (FastAPI serves both the API, real-time WebSocket, and the compiled React SPA) or as a decoupled system.
 
-### Option 1: Render.com (Recommended — 1-Click Free Web Service)
-1. Push your repository to GitHub.
-2. Sign in to [Render.com](https://render.com) and click **New +** → **Web Service** (or use **Blueprint** with the included `render.yaml`).
-3. Connect your `HackMatrix` GitHub repository.
-4. Configure settings:
-   - **Environment:** `Python 3`
-   - **Build Command:** `./build.sh` (or `cd frontend && npm install && npm run build && cd ../backend_py && pip install -r requirements.txt`)
-   - **Start Command:** `python -m uvicorn main:app --app-dir backend_py --host 0.0.0.0 --port $PORT`
-   - **Plan:** Free
-5. (Optional) In **Environment Variables**, add:
-   - `GEMINI_API_KEY`: *(Your Google AI Gemini key for real-time field report parsing)*
-6. Click **Deploy Web Service**! Render will build the React frontend, install backend dependencies, and launch ResQGrid with live WebSocket support.
+### Option 1: Render.com (Recommended — 1-Click Free Web Service via Docker)
+
+#### Method A: 1-Click Blueprint (Fastest & Automatic)
+1. Sign in to [Render.com](https://render.com).
+2. Click **New +** → **Blueprint**.
+3. Select your GitHub repository: `hjkhairnar2104-code/HackMatrix`.
+4. Render automatically reads [render.yaml](file:///d:/Artimas/render.yaml) and configures the web service, Dockerfile, port, and health check.
+5. (Optional) Set `GEMINI_API_KEY` under Environment Variables.
+6. Click **Apply**. Render will build and deploy your live URL with full WebSocket support!
+
+#### Method B: Manual Web Service
+1. Click **New +** → **Web Service**.
+2. Connect your `HackMatrix` GitHub repository.
+3. Configure settings:
+   - **Name:** `resqgrid`
+   - **Language / Runtime:** `Docker` *(Render automatically picks up the `Dockerfile`)*
+   - **Region:** `Oregon (US West)` or your closest region
+   - **Instance Type:** `Free`
+4. (Optional) Under **Environment Variables**, add:
+   - `GEMINI_API_KEY`: *(your Gemini key for field report extraction)*
+5. Click **Deploy Web Service**!
 
 ---
 
