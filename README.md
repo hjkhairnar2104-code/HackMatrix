@@ -83,3 +83,63 @@ Use the **Demo scenario** buttons (each step is rebuilt from baseline, so any st
 6. **Final Plan** — #1 Village B, #2 Village A; recommendations, confidence, and **Explain decision**.
 
 Also try: block any road from the toolbar, the 3 route scenarios on *Resources & Routes*, "Mark deployed", and *Replay & Evaluation*.
+
+---
+
+## 🌐 Production Deployment Guide
+
+ResQGrid is production-ready and can be deployed as a **single unified web service** (FastAPI serves both the API, real-time WebSocket, and the compiled React SPA) or as a decoupled system.
+
+### Option 1: Render.com (Recommended — 1-Click Free Web Service)
+1. Push your repository to GitHub.
+2. Sign in to [Render.com](https://render.com) and click **New +** → **Web Service** (or use **Blueprint** with the included `render.yaml`).
+3. Connect your `HackMatrix` GitHub repository.
+4. Configure settings:
+   - **Environment:** `Python 3`
+   - **Build Command:** `./build.sh` (or `cd frontend && npm install && npm run build && cd ../backend_py && pip install -r requirements.txt`)
+   - **Start Command:** `python -m uvicorn main:app --app-dir backend_py --host 0.0.0.0 --port $PORT`
+   - **Plan:** Free
+5. (Optional) In **Environment Variables**, add:
+   - `GEMINI_API_KEY`: *(Your Google AI Gemini key for real-time field report parsing)*
+6. Click **Deploy Web Service**! Render will build the React frontend, install backend dependencies, and launch ResQGrid with live WebSocket support.
+
+---
+
+### Option 2: Docker Container (Any Cloud / VPS / Local)
+Deploy anywhere Docker is installed with a single command:
+
+```bash
+# 1. Build the multi-stage production image:
+docker build -t resqgrid:latest .
+
+# 2. Run the unified container on port 8000:
+docker run -d -p 8000:8000 --name resqgrid-app resqgrid:latest
+```
+Visit `http://localhost:8000` to access the full live application.
+
+Or using Docker Compose:
+```bash
+docker compose up -d --build
+```
+
+---
+
+### Option 3: Railway.app / Heroku (Procfile)
+1. Connect your repository to [Railway.app](https://railway.app).
+2. Railway detects the `Dockerfile` or `Procfile` automatically.
+3. Set the environment variable `PORT` (Railway provides this automatically).
+4. Launch!
+
+---
+
+### Option 4: Split Deployment (Frontend on Vercel + Backend on Render/Railway)
+- **Backend (Render / Railway):**
+  - Root directory: `backend_py`
+  - Start command: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
+- **Frontend (Vercel):**
+  - Root directory: `frontend`
+  - Framework Preset: `Vite`
+  - Set Environment Variables:
+    - `VITE_API_URL`: `https://your-backend.onrender.com`
+    - `VITE_WS_URL`: `wss://your-backend.onrender.com/ws/live`
+

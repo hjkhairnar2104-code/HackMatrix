@@ -79,6 +79,16 @@ app = FastAPI(
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+import os
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+_FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+_ASSETS_DIR = os.path.join(_FRONTEND_DIST, "assets")
+
+if os.path.isdir(_ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
+
 
 @app.websocket("/ws/live")
 async def websocket_endpoint(websocket: WebSocket):
@@ -175,8 +185,16 @@ async def run_replay():
 # ------------------------------------------------------------------ read endpoints
 @app.get("/")
 def root():
+    index_file = os.path.join(_FRONTEND_DIST, "index.html")
+    if os.path.isfile(index_file):
+        return FileResponse(index_file)
     return {"platform": "ResQGrid", "tagline": "From scattered flood signals to prioritized rescue decisions.",
             "status": "ONLINE", "district": state_manager.district["districtName"], "realTimeWebSocket": "/ws/live"}
+
+
+@app.get("/api/health")
+def api_health():
+    return {"platform": "ResQGrid", "status": "HEALTHY", "district": state_manager.district["districtName"], "realTimeWebSocket": "/ws/live"}
 
 
 @app.get("/api/state")
@@ -323,6 +341,22 @@ async def explain_decision(req: ExplainRequest):
         return await run_in_threadpool(state_manager.explain, req.settlementId)
 
 
+# ------------------------------------------------------------------ Client-side SPA routing fallback
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    if full_path.startswith("api") or full_path.startswith("ws") or full_path.startswith("docs") or full_path.startswith("openapi.json"):
+        raise HTTPException(status_code=404, detail="Not found")
+    if os.path.isdir(_FRONTEND_DIST):
+        candidate = os.path.join(_FRONTEND_DIST, full_path)
+        if full_path and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        index_file = os.path.join(_FRONTEND_DIST, "index.html")
+        if os.path.isfile(index_file):
+            return FileResponse(index_file)
+    return {"status": "ok", "service": "ResQGrid API", "version": "2.0.0"}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

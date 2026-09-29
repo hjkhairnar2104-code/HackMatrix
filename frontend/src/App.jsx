@@ -48,7 +48,17 @@ export default function App() {
     let closed = false;
 
     const connect = () => {
-      ws = new WebSocket(`ws://${window.location.hostname}:8000/ws/live`);
+      let wsUrl = import.meta.env?.VITE_WS_URL;
+      if (!wsUrl) {
+        const isLocalDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+        if (isLocalDev && window.location.port !== '8000') {
+          wsUrl = `ws://${window.location.hostname}:8000/ws/live`;
+        } else {
+          const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          wsUrl = `${proto}//${window.location.host}/ws/live`;
+        }
+      }
+      ws = new WebSocket(wsUrl);
       ws.onopen = () => setWsConnected(true);
       ws.onmessage = (event) => {
         try {
