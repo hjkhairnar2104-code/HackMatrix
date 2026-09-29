@@ -1,31 +1,24 @@
 import asyncio
-import json
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Literal, Optional
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from services.state_manager import state_manager
 from services.evaluation_service import get_false_alert_evaluation
-from services.routing_engine import calculate_rescue_route
-from services.ai_ground_report import set_gemini_api_key, get_gemini_api_key
+from services.ai_ground_report import set_gemini_api_key, get_gemini_api_key, GEMINI_MODEL
 
-app = FastAPI(
-    title="ResQGrid API",
-    description="AI-assisted local flood warning, risk analysis and response coordination platform",
-    version="1.0.0"
-)
+REPLAY_FRAME_SECONDS = 4
+POLL_SECONDS = 30
 
-# Enable CORS for React frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# One writer at a time: every event runs the full recalculation loop
+state_lock = asyncio.Lock()
+replay_task: Optional[asyncio.Task] = None
 
-# WebSocket Connection Manager for Real-Time Live Push
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -34,11 +27,9 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections.append(websocket)
         try:
-            # Send initial state immediately upon connection
-            await websocket.send_json({
-                "type": "INITIAL_STATE",
-                "data": state_manager.get_full_state()
-            })
+            async with state_lock:
+                state = await run_in_threadpool(state_manager.get_full_state)
+            await websocket.send_json({"type": "INITIAL_STATE", "data": state})
         except Exception:
             self.disconnect(websocket)
 
@@ -53,248 +44,284 @@ class ConnectionManager:
             except Exception:
                 self.disconnect(connection)
 
+
 manager = ConnectionManager()
 
-# Background weather poller (fetches Open-Meteo every 35 seconds and broadcasts)
-async def weather_poller_task():
+
+async def poller_task():
+    """Refresh live weather periodically and push state to every client."""
     while True:
         try:
-            await asyncio.sleep(35)
-            # Re-evaluate live conditions
-            state = state_manager.get_full_state()
-            await manager.broadcast({
-                "type": "WEATHER_TICK",
-                "weather": state["weather"],
-                "data": state
-            })
+            await asyncio.sleep(POLL_SECONDS)
+            async with state_lock:
+                await run_in_threadpool(state_manager.refresh_live)
+                state = await run_in_threadpool(state_manager.get_full_state)
+            await manager.broadcast({"type": "WEATHER_TICK", "weather": state["weather"], "data": state})
         except asyncio.CancelledError:
             break
         except Exception as e:
             print(f"[Poller Error]: {e}")
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(weather_poller_task())
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(poller_task())
+    yield
+    task.cancel()
+
+
+app = FastAPI(
+    title="ResQGrid API",
+    description="AI-assisted local flood warning, risk analysis and response coordination platform",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 
 @app.websocket("/ws/live")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive & receive client triggers if any
-            data = await websocket.receive_text()
-            # If client sends ping or action
-            await websocket.send_json({"type": "PONG", "timestamp": str(asyncio.get_event_loop().time())})
+            await websocket.receive_text()
+            await websocket.send_json({"type": "PONG"})
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+
+# ------------------------------------------------------------------ request models
+Severity = Literal["LOW", "MODERATE", "HIGH", "CRITICAL"]
+ReporterType = Literal["CITIZEN", "WARD_OFFICER", "FIRST_RESPONDER"]
+
+
 class GroundReportRequest(BaseModel):
-    description: str
-    location: Optional[str] = "Village A (Wakad Khurd)"
-    severity: Optional[str] = "HIGH"
-    reporterType: Optional[str] = "CITIZEN"
+    description: str = Field(min_length=5, max_length=1000)
+    location: str = Field(default="Village A (Wakad Khurd)", max_length=120)
+    severity: Severity = "HIGH"
+    reporterType: ReporterType = "CITIZEN"
+    timestamp: Optional[str] = None
+
 
 class RainfallSimulationRequest(BaseModel):
-    incrementMm: Optional[float] = 55.0
+    incrementMm: float = Field(default=50.0, gt=0, le=300)
+
 
 class WaterLevelSimulationRequest(BaseModel):
-    incrementM: Optional[float] = 0.7
+    incrementM: float = Field(default=0.5, gt=0, le=3)
+
 
 class RoadBlockageRequest(BaseModel):
     roadId: str = "R12"
-    status: Optional[str] = None
+    status: Optional[Literal["OPEN", "AT_RISK", "BLOCKED"]] = None
+
 
 class ScenarioRouteRequest(BaseModel):
-    scenario: int  # 1, 2, or 3
-    settlementId: Optional[str] = "S1"
+    scenario: int = Field(ge=1, le=3)
+    settlementId: str = "S1"
+    apply: bool = False
+
+
+class ResourceStatusRequest(BaseModel):
+    status: Literal["AVAILABLE", "DEPLOYED", "BUSY", "UNAVAILABLE"]
+    assignment: Optional[str] = None
+
+
+class ExplainRequest(BaseModel):
+    settlementId: Optional[str] = None
+
 
 class ApiKeyConfigRequest(BaseModel):
-    geminiApiKey: str
+    geminiApiKey: str = Field(min_length=10)
 
+
+# ------------------------------------------------------------------ helpers
+async def mutate(event_type: str, fn, *args, **extra) -> Dict[str, Any]:
+    """Run a state change under the lock, off the event loop, then broadcast."""
+    await stop_replay_task()
+    async with state_lock:
+        try:
+            result = await run_in_threadpool(fn, *args)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=f"Unknown id: {e}")
+        state = await run_in_threadpool(state_manager.get_full_state)
+    await manager.broadcast({"type": event_type, "data": state, **extra})
+    return {"success": True, "result": result, "updatedState": state}
+
+
+async def stop_replay_task():
+    global replay_task
+    if replay_task and not replay_task.done():
+        replay_task.cancel()
+    replay_task = None
+
+
+async def run_replay():
+    frames = len(state_manager.replay_script["frames"])
+    try:
+        for i in range(frames):
+            async with state_lock:
+                await run_in_threadpool(state_manager.load_replay_frame, i, True)
+                state = await run_in_threadpool(state_manager.get_full_state)
+            await manager.broadcast({"type": "REPLAY_FRAME", "frame": i + 1, "data": state})
+            if i < frames - 1:
+                await asyncio.sleep(REPLAY_FRAME_SECONDS)
+    except asyncio.CancelledError:
+        async with state_lock:
+            state_manager.stop_replay()
+
+
+# ------------------------------------------------------------------ read endpoints
 @app.get("/")
 def root():
-    return {
-        "platform": "ResQGrid",
-        "tagline": "From scattered flood signals to prioritized rescue decisions.",
-        "status": "ONLINE",
-        "district": "Pune District (Mula-Pawana-Mutha Basin)",
-        "realTimeWebSocket": "/ws/live"
-    }
+    return {"platform": "ResQGrid", "tagline": "From scattered flood signals to prioritized rescue decisions.",
+            "status": "ONLINE", "district": state_manager.district["districtName"], "realTimeWebSocket": "/ws/live"}
+
 
 @app.get("/api/state")
-def get_system_state():
-    return state_manager.get_full_state()
+async def get_system_state():
+    # Wait for any in-flight recalculation so readers never see a half-applied event
+    async with state_lock:
+        return await run_in_threadpool(state_manager.get_full_state)
+
 
 @app.get("/api/weather/live")
-def get_live_weather():
-    state = state_manager.get_full_state()
-    return state["weather"]
+async def get_live_weather():
+    async with state_lock:
+        return (await run_in_threadpool(state_manager.get_full_state))["weather"]
+
 
 @app.get("/api/settlements")
 def get_settlements():
     return state_manager.settlements
 
+
 @app.get("/api/roads")
 def get_roads():
     return state_manager.roads
+
 
 @app.get("/api/resources")
 def get_resources():
     return state_manager.resources
 
+
 @app.get("/api/alerts")
 def get_alerts():
     return state_manager.alerts
 
+
 @app.get("/api/evaluation")
 def get_evaluation():
     return get_false_alert_evaluation()
+
 
 @app.get("/api/config/status")
 def get_config_status():
     has_key = bool(get_gemini_api_key())
     return {
         "geminiConfigured": has_key,
-        "aiProvider": "Gemini 1.5 Flash (Live)" if has_key else "Local Deterministic NLP Parser (Active Fallback)",
-        "weatherProvider": "Open-Meteo API (Live Automated Poller)",
-        "routingProvider": "NetworkX + OSRM Local District Graph",
-        "webSocketClients": len(manager.active_connections)
+        "aiProvider": f"Gemini ({GEMINI_MODEL}) with local parser fallback" if has_key else "Local rule-based parser (Gemini key not set)",
+        "weatherProvider": "Open-Meteo API (cached 60 s, fallback dataset)",
+        "routingProvider": "NetworkX district graph + OSRM street ETA check",
+        "webSocketClients": len(manager.active_connections),
     }
+
 
 @app.post("/api/config/gemini-key")
 async def update_gemini_key(req: ApiKeyConfigRequest):
     set_gemini_api_key(req.geminiApiKey)
-    return {
-        "success": True,
-        "message": "Gemini API key configured successfully.",
-        "aiProvider": "Gemini 1.5 Flash (Live)"
-    }
+    return {"success": True, "message": "Gemini API key configured.", "aiProvider": f"Gemini ({GEMINI_MODEL})"}
 
+
+# ------------------------------------------------------------------ events (each triggers the full dynamic loop)
 @app.post("/api/reports")
 async def submit_ground_report(req: GroundReportRequest):
-    new_report = state_manager.submit_ground_report(
-        description=req.description,
-        location=req.location or "Village A (Wakad)",
-        severity=req.severity or "HIGH",
-        reporter_type=req.reporterType or "CITIZEN"
-    )
-    full_state = state_manager.get_full_state()
-    # Real-time WebSocket broadcast
-    await manager.broadcast({
-        "type": "REPORT_CREATED",
-        "report": new_report,
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "report": new_report,
-        "updatedState": full_state
-    }
+    res = await mutate("REPORT_CREATED", state_manager.submit_ground_report, req.description, req.location, req.severity, req.reporterType, req.timestamp)
+    res["report"] = res["result"]
+    return res
+
 
 @app.post("/api/simulate/rainfall")
 async def simulate_rainfall(req: RainfallSimulationRequest):
-    state_manager.simulate_heavy_rainfall(req.incrementMm or 55.0)
-    full_state = state_manager.get_full_state()
-    await manager.broadcast({
-        "type": "HAZARD_UPDATE",
-        "event": "RAINFALL_SURGE",
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "message": f"Rainfall increased by {req.incrementMm} mm across district.",
-        "updatedState": full_state
-    }
+    return await mutate("HAZARD_UPDATE", state_manager.simulate_heavy_rainfall, req.incrementMm, event="RAINFALL_SURGE")
+
 
 @app.post("/api/simulate/waterlevel")
 async def simulate_waterlevel(req: WaterLevelSimulationRequest):
-    state_manager.simulate_water_level(req.incrementM or 0.7)
-    full_state = state_manager.get_full_state()
-    await manager.broadcast({
-        "type": "HAZARD_UPDATE",
-        "event": "WATER_LEVEL_SURGE",
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "message": f"River gauge water level increased by {req.incrementM} m.",
-        "updatedState": full_state
-    }
+    return await mutate("HAZARD_UPDATE", state_manager.simulate_water_level, req.incrementM, event="WATER_LEVEL_SURGE")
+
 
 @app.post("/api/simulate/road-blockage")
 async def simulate_road_blockage(req: RoadBlockageRequest):
-    state_manager.simulate_road_blockage(req.roadId, req.status)
-    full_state = state_manager.get_full_state()
-    await manager.broadcast({
-        "type": "ROAD_STATUS_CHANGED",
-        "roadId": req.roadId,
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "message": f"Road {req.roadId} blockage toggled.",
-        "updatedState": full_state
-    }
+    return await mutate("ROAD_STATUS_CHANGED", state_manager.set_road_status, req.roadId, req.status, roadId=req.roadId)
+
 
 @app.post("/api/simulate/step/{step_id}")
 async def trigger_step(step_id: int):
-    result = state_manager.trigger_hackathon_demo_step(step_id)
-    await manager.broadcast({
-        "type": "HACKATHON_STEP_TRIGGERED",
-        "step": step_id,
-        "title": result["title"],
-        "data": result["state"]
-    })
-    return result
+    if not 1 <= step_id <= 6:
+        raise HTTPException(status_code=400, detail="step must be 1-6")
+    res = await mutate("HACKATHON_STEP_TRIGGERED", state_manager.trigger_demo_step, step_id, step=step_id)
+    step = res["result"]
+    return {"step": step["step"], "title": step["title"], "description": step["description"], "changes": step["changes"], "state": res["updatedState"]}
+
 
 @app.post("/api/simulate/replay")
 async def trigger_replay():
-    state_manager.replay_historical_event()
-    full_state = state_manager.get_full_state()
-    await manager.broadcast({
-        "type": "REPLAY_STARTED",
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "message": "Historical Replay Mode loaded (15 August 2026 Monsoon Surge)",
-        "updatedState": full_state
-    }
+    global replay_task
+    await stop_replay_task()
+    replay_task = asyncio.create_task(run_replay())
+    await asyncio.sleep(0.3)  # let frame 1 load so the response reflects replay mode
+    async with state_lock:
+        state = await run_in_threadpool(state_manager.get_full_state)
+    return {"success": True, "message": "Replay started (REPLAYED / NOT LIVE)", "updatedState": state}
+
+
+@app.post("/api/simulate/replay/stop")
+async def stop_replay():
+    await stop_replay_task()
+    async with state_lock:
+        state_manager.stop_replay()
+        state = await run_in_threadpool(state_manager.get_full_state)
+    await manager.broadcast({"type": "REPLAY_STOPPED", "data": state})
+    return {"success": True, "updatedState": state}
+
 
 @app.post("/api/simulate/reset")
 async def reset_system():
-    state_manager.reset_to_baseline()
-    full_state = state_manager.get_full_state()
-    await manager.broadcast({
-        "type": "SYSTEM_RESET",
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "message": "System reset to Step 1 baseline situation.",
-        "updatedState": full_state
-    }
+    return await mutate("SYSTEM_RESET", state_manager.reset_to_baseline)
+
 
 @app.post("/api/simulate/real-world-live")
 async def set_real_world_live():
-    state_manager.set_real_world_live_mode()
-    full_state = state_manager.get_full_state()
-    await manager.broadcast({
-        "type": "REAL_WORLD_LIVE_SYNC",
-        "data": full_state
-    })
-    return {
-        "success": True,
-        "message": "System synced strictly to actual real-time outside weather (0mm / Normal).",
-        "updatedState": full_state
-    }
+    return await mutate("REAL_WORLD_LIVE_SYNC", state_manager.set_real_world_live_mode)
+
 
 @app.post("/api/routes/validate")
-def validate_route_scenario(req: ScenarioRouteRequest):
-    res_boat = next((r for r in state_manager.resources if r["id"] == "BOAT-02"), state_manager.resources[0])
-    village_a = next((s for s in state_manager.settlements if s["id"] == req.settlementId), state_manager.settlements[0])
-    route_res = calculate_rescue_route(res_boat, village_a, state_manager.roads, force_scenario=req.scenario)
-    return route_res
+async def validate_route_scenario(req: ScenarioRouteRequest):
+    if req.apply:
+        res = await mutate("ROAD_STATUS_CHANGED", state_manager.run_route_scenario, req.settlementId, req.scenario, True)
+        return {**res["result"], "updatedState": res["updatedState"]}
+    async with state_lock:
+        try:
+            return await run_in_threadpool(state_manager.run_route_scenario, req.settlementId, req.scenario, False)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=f"Unknown id: {e}")
+
+
+@app.post("/api/resources/{resource_id}/status")
+async def update_resource_status(resource_id: str, req: ResourceStatusRequest):
+    if req.status == "DEPLOYED" and not req.assignment:
+        raise HTTPException(status_code=400, detail="assignment (settlement id) required when DEPLOYED")
+    return await mutate("RESOURCE_UPDATED", state_manager.set_resource_status, resource_id, req.status, req.assignment)
+
+
+@app.post("/api/explain")
+async def explain_decision(req: ExplainRequest):
+    async with state_lock:
+        return await run_in_threadpool(state_manager.explain, req.settlementId)
+
 
 if __name__ == "__main__":
     import uvicorn

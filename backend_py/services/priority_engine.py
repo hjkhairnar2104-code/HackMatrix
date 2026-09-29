@@ -1,74 +1,80 @@
-from typing import List, Dict, Any, Tuple
+"""
+Dynamic Response Priority Engine.
 
-def calculate_response_priorities(settlements: List[Dict[str, Any]], roads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Priority != Risk.
-    Calculates operational response priority combining:
-    1. Flood Risk (40%)
-    2. Population Exposed (25%)
-    3. Road Accessibility Urgency (15%)
-    4. Ground Report Severity (20%)
-    """
-    scored = []
+Priority != risk. It combines flood risk with population exposed, ground
+evidence, whether responders can actually reach the place, and whether a
+resource is already covering it.
+"""
+from typing import Any, Dict, List
 
-    for s in settlements:
-        risk_score = s.get("riskScore", 50)
-        pop = s.get("population", 1000)
-        # Normalize population (0 - 5000 -> 0 - 100)
-        pop_score = min(100, (pop / 4000.0) * 100)
+from services.risk_engine import report_load
 
-        reports_count = s.get("groundReportsCount", 0)
-        report_score = min(100, reports_count * 35)
+WEIGHTS = {
+    "risk": 45,
+    "population": 15,
+    "groundReports": 15,
+    "reachability": 10,
+    "coverageGap": 15,
+}
 
-        accessibility = s.get("accessibility", "OPEN")
-        # If accessible or cut off, calculate urgency
-        if accessibility == "CUT_OFF":
-            # Cut off requires extreme urgent amphibious/boat response
-            access_urgency = 95
-        elif accessibility == "AT_RISK":
-            access_urgency = 75
-        else:
-            access_urgency = 50
+REACHABILITY = {"DIRECT": 1.0, "ALTERNATIVE": 0.7, "NONE": 0.4}
 
-        priority_score = int(
-            (risk_score * 0.40) +
-            (pop_score * 0.25) +
-            (access_urgency * 0.15) +
-            (report_score * 0.20)
-        )
-        priority_score = max(5, min(100, priority_score))
 
-        # Build explainable "WHY" bullet points
-        why_list = []
-        if risk_score >= 81:
-            why_list.append("Extreme flood danger (CRITICAL risk score)")
-        elif risk_score >= 61:
-            why_list.append("Elevated flood hazard (HIGH risk score)")
+def _clamp(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
-        why_list.append(f"{pop:,} residents exposed in immediate impact zone")
 
-        if reports_count >= 2:
-            why_list.append(f"Multiple urgent field reports ({reports_count}) requiring rescue intervention")
-        elif reports_count == 1:
-            why_list.append("1 verified citizen hazard report logged")
+def calculate_priority(s: Dict[str, Any], reports: List[Dict[str, Any]], feasibility: str, deployed_names: List[str]) -> Dict[str, Any]:
+    pop_f = _clamp(s["population"] / 4000.0)
+    rep_f = _clamp(report_load(reports) / 2.5)
+    reach_f = REACHABILITY[feasibility]
+    gap_f = 0.0 if deployed_names else 1.0
 
-        if accessibility == "CUT_OFF":
-            why_list.append("CRITICAL: Primary access roads severed — requires boat or aerial route")
-        elif accessibility == "AT_RISK":
-            why_list.append("Access route compromised by encroaching floodwater")
-        else:
-            why_list.append("Emergency route remains accessible for rapid vehicular deployment")
+    severe = [r for r in reports if (r.get("severity") or "").upper() in ("HIGH", "CRITICAL")]
+    reach_text = {
+        "DIRECT": "Accessible emergency route (primary road open)",
+        "ALTERNATIVE": "Reachable only via alternative route",
+        "NONE": "No surface route — escalation required",
+    }[feasibility]
 
-        item = dict(s)
-        item["responsePriority"] = priority_score
-        item["whyExplanation"] = why_list
-        scored.append(item)
+    factors = [
+        {"key": "risk", "label": "Flood risk", "points": WEIGHTS["risk"] * s["riskScore"] / 100,
+         "why": f"{s['riskStatus'].title()} flood risk ({s['riskScore']}/100)"},
+        {"key": "population", "label": "Population exposed", "points": WEIGHTS["population"] * pop_f,
+         "why": f"{s['population']:,} people exposed"},
+        {"key": "groundReports", "label": "Ground reports", "points": WEIGHTS["groundReports"] * rep_f,
+         "why": (f"{len(severe)} severe ground report(s)" if severe else f"{len(reports)} ground report(s)") if reports else "No ground reports yet"},
+        {"key": "reachability", "label": "Route reachability", "points": WEIGHTS["reachability"] * reach_f,
+         "why": reach_text},
+        {"key": "coverageGap", "label": "Resource coverage gap", "points": WEIGHTS["coverageGap"] * gap_f,
+         "why": "No resource currently deployed" if not deployed_names else f"Already covered by {', '.join(deployed_names)}"},
+    ]
+    for f in factors:
+        f["maxPoints"] = WEIGHTS[f["key"]]
+        f["points"] = round(f["points"], 1)
 
-    # Sort descending by responsePriority
-    scored.sort(key=lambda x: x["responsePriority"], reverse=True)
+    score = int(round(sum(f["points"] for f in factors)))
+    return {
+        "responsePriority": max(1, min(100, score)),
+        "priorityFactors": factors,
+        "priorityWhy": [f["why"] for f in factors if f["points"] > 0.3 * f["maxPoints"] or f["key"] in ("reachability", "coverageGap")],
+        "routeFeasibility": feasibility,
+    }
 
-    # Assign priorityRank 1, 2, 3...
-    for idx, item in enumerate(scored, 1):
-        item["priorityRank"] = idx
 
-    return scored
+def rank_settlements(settlements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranked = sorted(settlements, key=lambda s: (s["responsePriority"], s["riskScore"], s["population"]), reverse=True)
+    for i, s in enumerate(ranked, 1):
+        s["priorityRank"] = i
+    # Explain each rank relative to the next one down
+    for upper, lower in zip(ranked, ranked[1:]):
+        diffs = {f["key"]: f["points"] for f in upper["priorityFactors"]}
+        for f in lower["priorityFactors"]:
+            diffs[f["key"]] -= f["points"]
+        key = max(diffs, key=diffs.get)
+        label = next(f["label"] for f in upper["priorityFactors"] if f["key"] == key)
+        upper["rankReason"] = (f"Ranked above {lower['name']} mainly due to {label.lower()} "
+                               f"(+{diffs[key]:.1f} pts); total {upper['responsePriority']} vs {lower['responsePriority']}.")
+    if ranked:
+        ranked[-1]["rankReason"] = "Lowest current response priority in the district."
+    return ranked

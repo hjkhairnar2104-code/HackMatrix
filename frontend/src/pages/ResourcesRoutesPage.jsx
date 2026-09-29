@@ -1,274 +1,152 @@
 import React, { useState } from 'react';
-import { 
-  Truck, 
-  OctagonAlert, 
-  CheckCircle, 
-  XCircle, 
-  AlertTriangle, 
-  Navigation, 
-  MapPin, 
-  Clock, 
-  Ship, 
-  ShieldAlert, 
-  Building2, 
-  Home,
-  Check,
-  RotateCw
-} from 'lucide-react';
+import { Truck, OctagonAlert, Navigation, Loader2 } from 'lucide-react';
+import { RouteStatusCard } from './DashboardPage';
+import { RESOURCE_ICONS, ROAD_COLORS, pct, shortName } from '../utils';
 
-export default function ResourcesRoutesPage({ systemState, onValidateScenario, onToggleRoad }) {
-  const [selectedScenario, setSelectedScenario] = useState(1);
-  const [scenarioResult, setScenarioResult] = useState(null);
-  const [testingScenario, setTestingScenario] = useState(false);
+const SCENARIOS = [
+  { n: 1, title: 'Scenario 1 — All roads open', expect: 'Route → VALID', color: '#16a34a' },
+  { n: 2, title: 'Scenario 2 — Primary road blocked', expect: 'Original INVALID → alternative generated', color: '#d97706' },
+  { n: 3, title: 'Scenario 3 — Multiple roads blocked', expect: 'No valid route → ESCALATION', color: '#dc2626' },
+];
 
-  const resources = systemState?.resources || [];
-  const roads = systemState?.roads || [];
-  const route = systemState?.route || null;
-  const recommendations = systemState?.recommendations || [];
+const STATUS_COLORS = { AVAILABLE: ['#dcfce7', '#166534'], DEPLOYED: ['#dbeafe', '#1e40af'], BUSY: ['#fef3c7', '#92400e'], UNAVAILABLE: ['#e2e8f0', '#334155'] };
 
-  const handleRunScenario = async (scNum) => {
-    setSelectedScenario(scNum);
-    setTestingScenario(true);
-    try {
-      const res = await fetch('/api/routes/validate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenario: scNum, settlementId: 'S1' })
-      });
-      const data = await res.json();
-      setScenarioResult(data);
-    } catch (err) {
-      console.error('Failed to validate scenario route:', err);
-    } finally {
-      setTestingScenario(false);
-    }
+export default function ResourcesRoutesPage({ systemState, actions, busy }) {
+  const settlements = [...systemState.settlements].sort((a, b) => a.id.localeCompare(b.id));
+  const [targetId, setTargetId] = useState('S1');
+  const [scenario, setScenario] = useState(null);
+  const [result, setResult] = useState(null);
+  const recs = systemState.recommendations;
+
+  const runScenario = async (n, apply = false) => {
+    setScenario(n);
+    const data = await actions.scenario(targetId, n, apply);
+    if (data) setResult(data);
   };
 
-  const activeRouteData = scenarioResult || route;
-
   return (
-    <div style={{ padding: '24px', maxWidth: '1200px', margin: '0 auto' }}>
-      
-      <div style={{ marginBottom: '24px' }}>
-        <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', margin: 0 }}>
-          Emergency Resources & Route Validation Engine
-        </h1>
-        <p style={{ fontSize: '13px', color: '#64748b', marginTop: '4px' }}>
-          NetworkX graph routing with dynamic road blockage invalidation and alternative route calculation.
+    <div style={{ padding: 24, maxWidth: 1280, margin: '0 auto' }}>
+      <div style={{ marginBottom: 20 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0 }}>Resources & Routes</h1>
+        <p style={{ fontSize: 13, color: '#64748b', marginTop: 4 }}>
+          Shortest-path routing on the district road graph (NetworkX). Blocked roads are removed, at-risk roads penalised; OSRM gives a street-level ETA cross-check.
         </p>
       </div>
 
-      {/* SECTION 1: ROUTE VALIDITY TESTING SUITE (3 SCENARIOS) */}
-      <div className="panel-card" style={{ marginBottom: '24px', border: '2px solid #2563eb' }}>
-        <div className="panel-header" style={{ background: '#eff6ff', borderBottom: '1px solid #bfdbfe' }}>
-          <div className="panel-title" style={{ color: '#1e40af' }}>
-            <Navigation size={18} style={{ color: '#2563eb' }} />
-            <span>Interactive Route Validity Testing Suite (Section 14 Requirement)</span>
+      <div className="panel-card" style={{ border: '2px solid #2563eb' }}>
+        <div className="panel-header" style={{ background: '#eff6ff' }}>
+          <div className="panel-title" style={{ color: '#1e40af' }}><Navigation size={18} /><span>Route validity testing</span></div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+            <span>Target:</span>
+            <select value={targetId} onChange={(e) => { setTargetId(e.target.value); setResult(null); setScenario(null); }} style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #cbd5e1' }}>
+              {settlements.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
           </div>
-          <span style={{ fontSize: '11px', background: '#2563eb', color: 'white', fontWeight: 700, padding: '2px 8px', borderRadius: '4px' }}>
-            DEMONSTRABLE FROM UI
-          </span>
         </div>
-
         <div className="panel-body">
-          <p style={{ fontSize: '12px', color: '#334155', marginBottom: '14px' }}>
-            Select any of the three required hackathon scenarios to test real-time route checking, path invalidation, and alternative corridor discovery:
+          <p style={{ fontSize: 12, color: '#334155', marginBottom: 12 }}>
+            Each test runs on a copy of the road network from every available unit to the target. "Apply to live map" pushes the scenario's closures into the live system so the whole response loop updates.
           </p>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '12px', marginBottom: '16px' }}>
-            {/* Scenario 1 */}
-            <button
-              onClick={() => handleRunScenario(1)}
-              style={{
-                background: selectedScenario === 1 ? '#eff6ff' : '#ffffff',
-                border: selectedScenario === 1 ? '2px solid #2563eb' : '1px solid #cbd5e1',
-                borderRadius: '8px',
-                padding: '12px 14px',
-                textAlign: 'left',
-                cursor: 'pointer',
-                transition: 'all 0.15s'
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <b style={{ fontSize: '13px', color: '#0f172a' }}>Scenario 1 — All Roads Open</b>
-                <span style={{ fontSize: '10px', background: '#dcfce7', color: '#16a34a', fontWeight: 700, padding: '1px 6px', borderRadius: '4px' }}>
-                  VALID
-                </span>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12, marginBottom: 14 }}>
+            {SCENARIOS.map((sc) => (
+              <div key={sc.n} style={{ border: scenario === sc.n ? `2px solid ${sc.color}` : '1px solid #cbd5e1', borderRadius: 8, padding: 12, background: '#fff' }}>
+                <b style={{ fontSize: 13 }}>{sc.title}</b>
+                <div style={{ fontSize: 11, color: '#64748b', margin: '4px 0 10px' }}>Expected: {sc.expect}</div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button className="btn btn-secondary" style={{ fontSize: 11, padding: '4px 10px' }} onClick={() => runScenario(sc.n)} disabled={!!busy}>
+                    {busy === `scenario-${sc.n}` && <Loader2 size={12} className="spin" />} Run test
+                  </button>
+                  <button className="btn btn-primary" style={{ fontSize: 11, padding: '4px 10px' }} onClick={() => runScenario(sc.n, true)} disabled={!!busy}>Apply to live map</button>
+                </div>
               </div>
-              <div style={{ fontSize: '11px', color: '#64748b', marginTop: '4px' }}>
-                Primary Causeway R12 open. Direct optimal rescue route clear.
-              </div>
-            </button>
-
-            {/* Scenario 2 */}
-            <button
-              onClick={() => handleRunScenario(2)}
-              style={{
-                background: selectedScenario === 2 ? '#eff6ff' : '#ffffff',
-                border: selectedScenario === 2 ? '2px solid #2563eb' : '1px solid #cbd5e1',
-                borderRadius: '8px',
-                padding: '12px 14px',
-                textAlign: 'left',
-                cursor: 'pointer',
-                transition: 'all 0.15s'
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <b style={{ fontSize: '13px', color: '#0f172a' }}>Scenario 2 — Primary Road Blocked</b>
-                <span style={{ fontSize: '10px', background: '#fef3c7', color: '#d97706', fontWeight: 700, padding: '1px 6px', borderRadius: '4px' }}>
-                  ALTERNATIVE
-                </span>
-              </div>
-              <div style={{ fontSize: '11px', color: '#64748b', marginTop: '4px' }}>
-                Causeway R12 BLOCKED. Original invalidated, R7 High-Ridge bypass found.
-              </div>
-            </button>
-
-            {/* Scenario 3 */}
-            <button
-              onClick={() => handleRunScenario(3)}
-              style={{
-                background: selectedScenario === 3 ? '#fef2f2' : '#ffffff',
-                border: selectedScenario === 3 ? '2px solid #dc2626' : '1px solid #cbd5e1',
-                borderRadius: '8px',
-                padding: '12px 14px',
-                textAlign: 'left',
-                cursor: 'pointer',
-                transition: 'all 0.15s'
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <b style={{ fontSize: '13px', color: '#0f172a' }}>Scenario 3 — Multiple Roads Blocked</b>
-                <span style={{ fontSize: '10px', background: '#fee2e2', color: '#dc2626', fontWeight: 700, padding: '1px 6px', borderRadius: '4px' }}>
-                  ESCALATION
-                </span>
-              </div>
-              <div style={{ fontSize: '11px', color: '#64748b', marginTop: '4px' }}>
-                Both Causeway R12 & Bypass R7 submerged. Surface impossible, helicopter needed.
-              </div>
-            </button>
+            ))}
           </div>
 
-          {/* Scenario Result Output Box */}
-          {activeRouteData && (
-            <div style={{
-              background: '#f8fafc',
-              border: '1px solid #e2e8f0',
-              borderRadius: '8px',
-              padding: '16px'
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '10px' }}>
-                <div>
-                  <div style={{ fontSize: '14px', fontWeight: 800, color: '#0f172a' }}>
-                    Route Analysis for: {activeRouteData.resourceName} → {activeRouteData.targetSettlementName}
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#64748b', marginTop: '2px' }}>
-                    Route ID: <code style={{ color: '#2563eb' }}>{activeRouteData.routeId}</code>
-                  </div>
-                </div>
-
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <div className={`route-card ${activeRouteData.originalRouteStatus === 'VALID' ? 'valid' : 'invalid'}`} style={{ padding: '6px 12px', margin: 0 }}>
-                    <span style={{ fontSize: '11px', fontWeight: 700 }}>
-                      Original: {activeRouteData.originalRouteStatus === 'VALID' ? '✓ VALID' : '❌ INVALID'}
-                    </span>
-                  </div>
-
-                  {activeRouteData.alternativeRouteStatus && (
-                    <div className={`route-card ${activeRouteData.alternativeRouteStatus === 'VALID' ? 'alt' : 'invalid'}`} style={{ padding: '6px 12px', margin: 0 }}>
-                      <span style={{ fontSize: '11px', fontWeight: 700 }}>
-                        Alternative: {activeRouteData.alternativeRouteStatus}
-                      </span>
-                    </div>
-                  )}
-                </div>
+          {result?.route && (
+            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: 14 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 6 }}>
+                {result.scenarioLabel}: {result.blockedRoads.length ? `blocked ${result.blockedRoads.join(', ')}` : 'no closures'} {result.applied && <span style={{ color: '#2563eb' }}>· applied to live map</span>}
               </div>
-
-              {/* Path & Explanation */}
-              <div style={{ marginTop: '12px', borderTop: '1px solid #e2e8f0', paddingTop: '10px', fontSize: '12px', color: '#334155' }}>
-                <p style={{ lineHeight: 1.5, background: '#ffffff', padding: '10px', borderRadius: '6px', border: '1px solid #cbd5e1' }}>
-                  <b>Decision Engine Logic:</b> {activeRouteData.explanation}
-                </p>
-
-                {activeRouteData.alternativePath && (
-                  <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                    <span style={{ fontWeight: 700, color: '#0f172a' }}>Active Path Segments:</span>
-                    {activeRouteData.alternativePath.map((node, i) => (
-                      <React.Fragment key={i}>
-                        <span style={{ background: '#e0f2fe', color: '#0369a1', padding: '2px 8px', borderRadius: '4px', fontWeight: 600 }}>
-                          {node}
-                        </span>
-                        {i < activeRouteData.alternativePath.length - 1 && <span>→</span>}
-                      </React.Fragment>
-                    ))}
-                  </div>
-                )}
+              <RouteStatusCard rec={{ route: result.route, routeStatus: result.route.escalationRequired ? 'ESCALATION_REQUIRED' : 'VALID', recommendedResourceType: null }} />
+              <div style={{ fontSize: 12, background: '#fff', border: '1px solid #cbd5e1', borderRadius: 6, padding: 10 }}>
+                <b>Route engine:</b> {result.route.explanation}
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* SECTION 2: FLEET MANAGEMENT & RESOURCE RECOMMENDATION */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '20px' }}>
-        
-        {/* Resource Fleet List */}
+      <div className="panel-card">
+        <div className="panel-header">
+          <div className="panel-title"><Truck size={16} color="#16a34a" /><span>Resource recommendations (current plan)</span></div>
+          <span style={{ fontSize: 11, color: '#64748b' }}>Recommendation — final decision stays with the operator</span>
+        </div>
+        <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 16 }}>
+          {recs.map((rec) => (
+            <div key={rec.settlementId} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 12 }}>
+              <div style={{ fontSize: 11, color: '#64748b' }}>TARGET · priority #{rec.priorityRank} · risk {rec.riskScore} · {rec.population.toLocaleString()} people</div>
+              <div style={{ fontSize: 15, fontWeight: 800, margin: '2px 0 8px' }}>{rec.settlementName}</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f0fdf4', border: '1px solid #86efac', borderRadius: 6, padding: '8px 10px', marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: 10, color: '#166534', fontWeight: 700 }}>RECOMMENDED RESOURCE</div>
+                  <div style={{ fontSize: 14, fontWeight: 800 }}>{RESOURCE_ICONS[rec.recommendedResourceType] || '⚠️'} {rec.recommendedResourceName || 'Escalate'}</div>
+                </div>
+                <div style={{ textAlign: 'right', fontSize: 12 }}>
+                  {rec.etaMinutes != null && <div><b>{rec.distanceKm} km · ETA {rec.etaMinutes} min</b></div>}
+                  <div style={{ color: '#64748b' }}>confidence {pct(rec.confidenceScore)}</div>
+                </div>
+              </div>
+              {rec.route && <RouteStatusCard rec={rec} />}
+              <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 3 }}>Why this resource?</div>
+              <ul style={{ margin: '0 0 8px 16px', padding: 0, fontSize: 11 }}>{rec.whySelected.map((w, i) => <li key={i}>{w}</li>)}</ul>
+              {rec.candidatesConsidered.length > 0 && (
+                <table style={{ width: '100%', fontSize: 10, borderCollapse: 'collapse', marginBottom: 8 }}>
+                  <thead><tr style={{ color: '#64748b', textAlign: 'left' }}><th>Considered</th><th>ETA</th><th>Score</th><th>Note</th></tr></thead>
+                  <tbody>
+                    {rec.candidatesConsidered.map((c) => (
+                      <tr key={c.resourceId} style={{ borderTop: '1px solid #f1f5f9', fontWeight: c.resourceId === rec.recommendedResourceId ? 700 : 400 }}>
+                        <td>{c.resourceName}</td><td>{c.etaMinutes ?? '—'} min</td><td>{c.score ?? '—'}</td><td>{c.note}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {rec.nearestShelter && <div style={{ fontSize: 11, color: '#475569' }}>🏠 Nearest shelter: {rec.nearestShelter.name} ({rec.nearestShelter.distanceKm} km)</div>}
+              {rec.recommendedResourceId && (
+                <button className="btn btn-primary" style={{ fontSize: 11, padding: '4px 10px', marginTop: 8 }} disabled={!!busy}
+                  onClick={() => actions.resourceStatus(rec.recommendedResourceId, 'DEPLOYED', rec.settlementId)}>
+                  Mark {rec.recommendedResourceName} as deployed
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 20 }}>
         <div className="panel-card">
           <div className="panel-header">
-            <div className="panel-title">
-              <Truck size={16} style={{ color: '#16a34a' }} />
-              <span>Emergency Fleet Assets ({resources.length})</span>
-            </div>
-            <span style={{ fontSize: '11px', color: '#64748b' }}>Section 15 Specification</span>
+            <div className="panel-title"><Truck size={16} color="#16a34a" /><span>Emergency resources ({systemState.resources.length})</span></div>
           </div>
-
           <div className="panel-body">
-            {resources.map((res) => {
-              let iconComp = <Truck size={18} />;
-              if (res.type === 'RESCUE_BOAT') iconComp = <Ship size={18} style={{ color: '#0284c7' }} />;
-              if (res.type === 'AMBULANCE') iconComp = <Truck size={18} style={{ color: '#dc2626' }} />;
-              if (res.type === 'RESCUE_TEAM') iconComp = <ShieldAlert size={18} style={{ color: '#f59e0b' }} />;
-              if (res.type === 'HOSPITAL') iconComp = <Building2 size={18} style={{ color: '#16a34a' }} />;
-              if (res.type === 'SHELTER') iconComp = <Home size={18} style={{ color: '#7c3aed' }} />;
-
+            {systemState.resources.map((res) => {
+              const [bg, fg] = STATUS_COLORS[res.status];
+              const target = systemState.settlements.find((s) => s.id === res.currentAssignment);
               return (
-                <div
-                  key={res.id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    padding: '10px 12px',
-                    borderRadius: '8px',
-                    border: '1px solid #e2e8f0',
-                    background: '#ffffff',
-                    marginBottom: '8px'
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <div style={{ background: '#f8fafc', padding: '6px', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                      {iconComp}
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '13px', fontWeight: 700, color: '#0f172a' }}>{res.name}</div>
-                      <div style={{ fontSize: '11px', color: '#64748b' }}>{res.locationName}</div>
-                    </div>
+                <div key={res.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '9px 12px', borderRadius: 8, border: '1px solid #e2e8f0', marginBottom: 8, gap: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{RESOURCE_ICONS[res.type]} {res.name}</div>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>{res.type.replace('_', ' ')} · {res.locationName}{target ? ` · assigned to ${shortName(target.name)}` : ''}</div>
                   </div>
-
-                  <div style={{ textAlign: 'right' }}>
-                    <span style={{
-                      fontSize: '10px',
-                      fontWeight: 700,
-                      padding: '2px 8px',
-                      borderRadius: '12px',
-                      background: res.status === 'AVAILABLE' ? '#dcfce7' : '#fee2e2',
-                      color: res.status === 'AVAILABLE' ? '#166534' : '#991b1b'
-                    }}>
-                      {res.status}
-                    </span>
-                    <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px' }}>
-                      {res.speedKmh > 0 ? `${res.speedKmh} km/h` : 'Stationary'}
-                    </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 12, background: bg, color: fg }}>{res.status}</span>
+                    {res.mobile && (
+                      <select value="" disabled={!!busy} onChange={(e) => e.target.value && actions.resourceStatus(res.id, e.target.value, null)}
+                        style={{ fontSize: 10, padding: '2px 4px', borderRadius: 4, border: '1px solid #cbd5e1' }}>
+                        <option value="">Set…</option>
+                        {['AVAILABLE', 'BUSY', 'UNAVAILABLE'].filter((s) => s !== res.status).map((s) => <option key={s} value={s}>{s}</option>)}
+                      </select>
+                    )}
                   </div>
                 </div>
               );
@@ -276,61 +154,33 @@ export default function ResourcesRoutesPage({ systemState, onValidateScenario, o
           </div>
         </div>
 
-        {/* Road Network State */}
         <div className="panel-card">
           <div className="panel-header">
-            <div className="panel-title">
-              <OctagonAlert size={16} style={{ color: '#ea580c' }} />
-              <span>District Road Network Telemetry ({roads.length})</span>
-            </div>
-            <span style={{ fontSize: '11px', color: '#64748b' }}>Click to Toggle Blockage</span>
+            <div className="panel-title"><OctagonAlert size={16} color="#ea580c" /><span>Road network ({systemState.roads.length})</span></div>
           </div>
-
           <div className="panel-body">
-            {roads.map((road) => (
-              <div
-                key={road.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  padding: '10px 12px',
-                  borderRadius: '8px',
-                  border: road.status === 'BLOCKED' ? '1px solid #fca5a5' : '1px solid #e2e8f0',
-                  background: road.status === 'BLOCKED' ? '#fef2f2' : '#ffffff',
-                  marginBottom: '8px'
-                }}
-              >
-                <div>
-                  <div style={{ fontSize: '13px', fontWeight: 700, color: '#0f172a' }}>{road.name}</div>
-                  <div style={{ fontSize: '11px', color: '#64748b' }}>
-                    {road.source} → {road.destination} ({road.distanceKm} km)
+            {systemState.roads.map((road) => (
+              <div key={road.id} style={{ padding: '8px 12px', borderRadius: 8, border: `1px solid ${road.status === 'OPEN' ? '#e2e8f0' : ROAD_COLORS[road.status]}`, marginBottom: 8 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{road.id} · {road.name}</div>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>{road.sourceName} ↔ {road.destinationName} · {road.distanceKm} km{road.floodProne ? ' · flood-prone' : ''}</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 3 }}>
+                    {['OPEN', 'AT_RISK', 'BLOCKED'].map((st) => (
+                      <button key={st} disabled={!!busy} onClick={() => actions.setRoad(road.id, st)} style={{
+                        fontSize: 10, fontWeight: 700, padding: '3px 7px', borderRadius: 4, cursor: 'pointer',
+                        border: `1px solid ${ROAD_COLORS[st]}`, background: road.status === st ? ROAD_COLORS[st] : '#fff', color: road.status === st ? '#fff' : ROAD_COLORS[st],
+                      }}>{st.replace('_', ' ')}</button>
+                    ))}
                   </div>
                 </div>
-
-                <button
-                  onClick={() => onToggleRoad(road.id)}
-                  style={{
-                    background: road.status === 'BLOCKED' ? '#dc2626' : '#10b981',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '6px',
-                    padding: '4px 10px',
-                    fontSize: '11px',
-                    fontWeight: 700,
-                    cursor: 'pointer'
-                  }}
-                  title="Click to toggle status"
-                >
-                  {road.status === 'BLOCKED' ? 'BLOCKED 🔴' : 'OPEN 🟢'}
-                </button>
+                <div style={{ fontSize: 10, color: '#64748b', marginTop: 3, fontStyle: 'italic' }}>{road.statusReason}</div>
               </div>
             ))}
           </div>
         </div>
-
       </div>
-
     </div>
   );
 }

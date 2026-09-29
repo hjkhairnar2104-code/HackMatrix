@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Navbar from './components/Navbar';
 import SimulatorToolbar from './components/SimulatorToolbar';
 import DashboardPage from './pages/DashboardPage';
@@ -7,348 +7,147 @@ import IncidentsPage from './pages/IncidentsPage';
 import GroundReportsPage from './pages/GroundReportsPage';
 import ResourcesRoutesPage from './pages/ResourcesRoutesPage';
 import EvaluationReplayPage from './pages/EvaluationReplayPage';
+import { api } from './utils';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [systemState, setSystemState] = useState(null);
+  const [systemState, setSystemStateRaw] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [toastMessage, setToastMessage] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [busy, setBusy] = useState(null);
   const [wsConnected, setWsConnected] = useState(false);
+  const toastTimer = useRef(null);
 
-  const wsRef = useRef(null);
+  // Responses can arrive out of order (poll vs. action vs. WebSocket); never replace newer state with older
+  const setSystemState = useCallback((next) => {
+    setSystemStateRaw((prev) => (!prev || !next?.version || next.instanceId !== prev.instanceId || next.version >= prev.version ? next : prev));
+  }, []);
 
-  // Fetch current system state from backend via REST fallback
-  const fetchState = async () => {
+  const showToast = useCallback((msg, kind = 'info') => {
+    setToast({ msg, kind });
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), kind === 'error' ? 6000 : 4000);
+  }, []);
+
+  const fetchState = useCallback(async () => {
     try {
-      const res = await fetch('/api/state');
-      if (res.ok) {
-        const data = await res.json();
-        setSystemState(data);
-      }
+      setSystemState(await api('/api/state'));
+      setLoadError(null);
     } catch (err) {
-      console.error('Failed to fetch system state:', err);
+      setLoadError(err.message);
     } finally {
       setLoading(false);
     }
-  };
+  }, [setSystemState]);
 
-  // Real-Time WebSocket Connection
   useEffect(() => {
     fetchState();
-
     let ws = null;
     let reconnectTimeout = null;
+    let closed = false;
 
-    const connectWebSocket = () => {
-      // Connect to FastAPI WebSocket endpoint on port 8000
-      const wsUrl = `ws://${window.location.hostname}:8000/ws/live`;
-      try {
-        ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          setWsConnected(true);
-          console.log('[ResQGrid WS] Connected to live event stream');
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.data) {
-              setSystemState(msg.data);
-            }
-            if (msg.type === 'REPORT_CREATED') {
-              showToast(`🚨 New Ground Report Ingested & AI Verified!`);
-            } else if (msg.type === 'ROAD_STATUS_CHANGED') {
-              showToast(`🚧 Road Network Altered: Routes Recalculated!`);
-            } else if (msg.type === 'HAZARD_UPDATE') {
-              showToast(`🌧️ Hazard Dynamic Shift: Risk & Priorities Updated!`);
-            }
-          } catch (e) {
-            console.error('[ResQGrid WS] Message parse error:', e);
-          }
-        };
-
-        ws.onclose = () => {
-          setWsConnected(false);
-          console.log('[ResQGrid WS] Disconnected. Reconnecting in 3s...');
-          reconnectTimeout = setTimeout(connectWebSocket, 3000);
-        };
-
-        ws.onerror = (err) => {
-          console.warn('[ResQGrid WS] Connection error:', err);
-          ws.close();
-        };
-      } catch (err) {
-        console.error('[ResQGrid WS] Failed to init WebSocket:', err);
-        reconnectTimeout = setTimeout(connectWebSocket, 3000);
-      }
+    const connect = () => {
+      ws = new WebSocket(`ws://${window.location.hostname}:8000/ws/live`);
+      ws.onopen = () => setWsConnected(true);
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.data) setSystemState(msg.data);
+        } catch (e) {
+          console.error('[ResQGrid WS] parse error', e);
+        }
+      };
+      ws.onclose = () => {
+        setWsConnected(false);
+        if (!closed) reconnectTimeout = setTimeout(connect, 3000);
+      };
+      ws.onerror = () => ws.close();
     };
+    connect();
 
-    connectWebSocket();
-
-    // Fallback sync polling every 10 seconds in case WebSocket drops
-    const interval = setInterval(fetchState, 10000);
-
+    // REST fallback in case the socket drops
+    const interval = setInterval(fetchState, 15000);
     return () => {
+      closed = true;
       clearInterval(interval);
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      clearTimeout(reconnectTimeout);
       if (ws) ws.close();
     };
-  }, []);
+  }, [fetchState, setSystemState]);
 
-  const showToast = (msg) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
-  };
-
-  // Hackathon Step Execution
-  const handleSimulateStep = async (stepNum) => {
+  // Every action: loading state, error toast, state refresh from the response
+  const run = useCallback(async (key, path, body, successMsg) => {
+    setBusy(key);
     try {
-      const res = await fetch(`/api/simulate/step/${stepNum}`, { method: 'POST' });
-      const data = await res.json();
-      if (data && data.state) {
-        setSystemState(data.state);
-        showToast(`⚡ Step ${stepNum}: ${data.title}`);
-      }
+      const data = await api(path, body ?? {});
+      const next = data?.updatedState || data?.state;
+      if (next) setSystemState(next);
+      if (successMsg) showToast(typeof successMsg === 'function' ? successMsg(data) : successMsg);
+      return data;
     } catch (err) {
-      console.error('Error executing step:', err);
+      showToast(`⚠️ ${err.message}`, 'error');
+      return null;
+    } finally {
+      setBusy(null);
     }
+  }, [showToast, setSystemState]);
+
+  const actions = {
+    step: (n) => run(`step-${n}`, `/api/simulate/step/${n}`, {}, (d) => d.title),
+    rainfall: (incrementMm = 50) => run('rainfall', '/api/simulate/rainfall', { incrementMm }, `Added ${incrementMm} mm of rain — plan updated`),
+    waterLevel: (incrementM = 0.5) => run('water', '/api/simulate/waterlevel', { incrementM }, `River level raised ${incrementM} m — plan updated`),
+    setRoad: (roadId, status) => run(`road-${roadId}`, '/api/simulate/road-blockage', { roadId, status },
+      (d) => `Road ${roadId} is now ${d.updatedState.roads.find((r) => r.id === roadId)?.status.replace('_', ' ').toLowerCase()} — routes rechecked`),
+    report: (payload) => run('report', '/api/reports', payload,
+      (d) => `Report ${d.report.id} read by AI (${Math.round((d.report.extractedInfo?.confidence || 0) * 100)}% confidence) — plan updated`),
+    scenario: (settlementId, scenario, apply) => run(`scenario-${scenario}`, '/api/routes/validate', { settlementId, scenario, apply },
+      apply ? `Test ${scenario} applied to the live map` : null),
+    resourceStatus: (id, status, assignment) => run(`res-${id}`, `/api/resources/${id}/status`, { status, assignment },
+      `${id} is now ${status.toLowerCase()}`),
+    explain: (settlementId) => run('explain', '/api/explain', { settlementId }),
+    replay: () => run('replay', '/api/simulate/replay', {}, 'Replay started (not live data)'),
+    stopReplay: () => run('replay-stop', '/api/simulate/replay/stop', {}, 'Replay paused'),
+    reset: () => run('reset', '/api/simulate/reset', {}, 'Reset to a normal day'),
+    live: () => run('live', '/api/simulate/real-world-live', {}, "Now using today's real rainfall"),
   };
 
-  // What-If Simulation Triggers
-  const handleSimulateRainfall = async (incrementMm = 50) => {
-    try {
-      const res = await fetch('/api/simulate/rainfall', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ incrementMm })
-      });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        showToast(`🌧️ Simulated +${incrementMm}mm Rainfall. Risk & Priorities Recalculated!`);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleSimulateWaterLevel = async (incrementM = 0.6) => {
-    try {
-      const res = await fetch('/api/simulate/waterlevel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ incrementM })
-      });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        showToast(`🌊 Simulated +${incrementM}m River Gauge. Gauges Updated!`);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleToggleRoad = async (roadId = 'R12') => {
-    try {
-      const res = await fetch('/api/simulate/road-blockage', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roadId })
-      });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        const road = data.updatedState.roads.find(r => r.id === roadId);
-        showToast(`🚧 Road ${roadId} is now ${road?.status}. Route Invalidated & Alternative Re-checked!`);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleSubmitReport = async (reportData) => {
-    try {
-      const res = await fetch('/api/reports', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(reportData)
-      });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        showToast(`📝 Field report analyzed by AI with ${Math.round((data.report.extractedInfo?.confidence || 0.9) * 100)}% confidence.`);
-        return data;
-      }
-    } catch (err) {
-      console.error(err);
-    }
-    return null;
-  };
-
-  const handleReplay = async () => {
-    try {
-      const res = await fetch('/api/simulate/replay', { method: 'POST' });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        showToast(`⏮️ Replay Mode Loaded: 15 August 2026 Monsoon Surge`);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleReset = async () => {
-    try {
-      const res = await fetch('/api/simulate/reset', { method: 'POST' });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        showToast(`🔄 Reset to Hackathon Baseline Flood Scenario.`);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleSetRealWorldLive = async () => {
-    try {
-      const res = await fetch('/api/simulate/real-world-live', { method: 'POST' });
-      const data = await res.json();
-      if (data && data.updatedState) {
-        setSystemState(data.updatedState);
-        showToast(`🟢 Synced with Real-Time Outside Weather (0.0mm / Normal / No Flood)`);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleSaveGeminiKey = async (key) => {
-    const res = await fetch('/api/config/gemini-key', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ geminiApiKey: key })
-    });
-    return res.json();
-  };
-
-  if (loading && !systemState) {
+  if (!systemState) {
     return (
-      <div style={{
-        minHeight: '100vh',
-        background: '#090f1d',
-        color: '#ffffff',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontFamily: 'Inter, sans-serif'
-      }}>
-        <div style={{ fontSize: '20px', fontWeight: 800, marginBottom: '8px' }}>
-          ResQGrid Decision Platform
+      <div style={{ minHeight: '100vh', background: '#090f1d', color: '#fff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+        <div style={{ fontSize: 20, fontWeight: 800 }}>ResQGrid Decision Platform</div>
+        <div style={{ fontSize: 13, color: loadError ? '#f87171' : '#94a3b8' }}>
+          {loading ? 'Connecting to the ResQGrid backend…' : `Backend unreachable: ${loadError}. Start it with: cd backend_py && .venv\\Scripts\\python -m uvicorn main:app --port 8000`}
         </div>
-        <div style={{ fontSize: '13px', color: '#94a3b8' }}>
-          Initializing Pune District telemetry & Open-Meteo feeds...
-        </div>
+        {!loading && <button className="btn btn-primary" onClick={() => { setLoading(true); fetchState(); }}>Retry</button>}
       </div>
     );
   }
 
+  const pageProps = { systemState, actions, busy };
+
   return (
     <div className="app-container">
-      {/* 1. Header Navigation */}
-      <Navbar 
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        systemState={systemState}
-        onRefresh={fetchState}
-        onReset={handleReset}
-        wsConnected={wsConnected}
-      />
+      <Navbar activeTab={activeTab} setActiveTab={setActiveTab} systemState={systemState} onReset={actions.reset} wsConnected={wsConnected} />
+      <SimulatorToolbar {...pageProps} />
 
-      {/* 2. Interactive Hackathon Demo Stepper & What-If Controls */}
-      <SimulatorToolbar 
-        systemState={systemState}
-        onSimulateStep={handleSimulateStep}
-        onSimulateRainfall={handleSimulateRainfall}
-        onSimulateWaterLevel={handleSimulateWaterLevel}
-        onToggleRoad={handleToggleRoad}
-        onReplay={handleReplay}
-        onReset={handleReset}
-        onSetRealWorldLive={handleSetRealWorldLive}
-      />
-
-      {/* 3. Main Views */}
       <main style={{ flex: 1 }}>
-        {activeTab === 'dashboard' && (
-          <DashboardPage 
-            systemState={systemState}
-            onToggleRoad={handleToggleRoad}
-            onSimulateRainfall={handleSimulateRainfall}
-            onSimulateWaterLevel={handleSimulateWaterLevel}
-          />
-        )}
-
-        {activeTab === 'map' && (
-          <DisasterMapPage 
-            systemState={systemState}
-            onToggleRoad={handleToggleRoad}
-          />
-        )}
-
-        {activeTab === 'incidents' && (
-          <IncidentsPage 
-            systemState={systemState}
-          />
-        )}
-
-        {activeTab === 'reports' && (
-          <GroundReportsPage 
-            systemState={systemState}
-            onSubmitReport={handleSubmitReport}
-          />
-        )}
-
-        {activeTab === 'routes' && (
-          <ResourcesRoutesPage 
-            systemState={systemState}
-            onToggleRoad={handleToggleRoad}
-          />
-        )}
-
-        {activeTab === 'replay' && (
-          <EvaluationReplayPage 
-            systemState={systemState}
-            onReplay={handleReplay}
-            onReset={handleReset}
-          />
-        )}
+        {activeTab === 'dashboard' && <DashboardPage {...pageProps} />}
+        {activeTab === 'map' && <DisasterMapPage {...pageProps} />}
+        {activeTab === 'incidents' && <IncidentsPage {...pageProps} />}
+        {activeTab === 'reports' && <GroundReportsPage {...pageProps} />}
+        {activeTab === 'routes' && <ResourcesRoutesPage {...pageProps} />}
+        {activeTab === 'replay' && <EvaluationReplayPage {...pageProps} />}
       </main>
 
-      {/* 5. Live Toast Notification */}
-      {toastMessage && (
+      {toast && (
         <div style={{
-          position: 'fixed',
-          bottom: '24px',
-          right: '24px',
-          background: '#0f172a',
-          color: '#ffffff',
-          padding: '12px 18px',
-          borderRadius: '8px',
-          boxShadow: '0 10px 25px rgba(0,0,0,0.4)',
-          border: '1px solid #334155',
-          fontSize: '13px',
-          fontWeight: 600,
-          zIndex: 9999,
-          display: 'flex',
-          alignItems: 'center',
-          gap: '8px'
+          position: 'fixed', bottom: 24, right: 24, zIndex: 9999, maxWidth: 420,
+          background: toast.kind === 'error' ? '#7f1d1d' : '#0f172a', color: '#fff',
+          padding: '12px 18px', borderRadius: 8, fontSize: 13, fontWeight: 600,
+          border: `1px solid ${toast.kind === 'error' ? '#ef4444' : '#334155'}`, boxShadow: '0 10px 25px rgba(0,0,0,0.4)',
         }}>
-          <span>{toastMessage}</span>
+          {toast.msg}
         </div>
       )}
     </div>

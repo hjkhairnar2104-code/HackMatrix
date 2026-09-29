@@ -1,212 +1,164 @@
 import React, { useEffect, useState } from 'react';
-import { 
-  History, 
-  CheckCircle2, 
-  AlertTriangle, 
-  ShieldAlert, 
-  Play, 
-  RotateCcw, 
-  FileCheck, 
-  BarChart3,
-  Info
-} from 'lucide-react';
+import { History, Play, Square, RotateCcw, FileCheck, Info, Loader2 } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid, BarChart, Bar, Cell, ReferenceLine } from 'recharts';
+import { api, shortName } from '../utils';
 
-export default function EvaluationReplayPage({ systemState, onReplay, onReset }) {
+const LINE_COLORS = ['#dc2626', '#ea580c', '#2563eb', '#16a34a', '#7c3aed'];
+const VERDICT = {
+  CORRECT_ALERT: ['#dcfce7', '#166534', 'Correct alert'],
+  CORRECT_NO_ALERT: ['#f1f5f9', '#334155', 'Correct — no alert'],
+  FALSE_ALERT: ['#fee2e2', '#991b1b', 'False alert'],
+  MISSED_EVENT: ['#fef3c7', '#92400e', 'Missed event'],
+};
+
+export default function EvaluationReplayPage({ systemState, actions, busy }) {
   const [evalData, setEvalData] = useState(null);
-  const isReplayMode = systemState?.mode === 'REPLAYED_DATA';
+  const [evalError, setEvalError] = useState(null);
+  const replay = systemState.replay;
+  const isReplay = systemState.mode === 'REPLAYED_DATA';
+  const settlements = [...systemState.settlements].sort((a, b) => a.id.localeCompare(b.id));
 
   useEffect(() => {
-    fetch('/api/evaluation')
-      .then(res => res.json())
-      .then(data => setEvalData(data))
-      .catch(err => console.error('Failed to load evaluation data:', err));
+    api('/api/evaluation').then(setEvalData).catch((e) => setEvalError(e.message));
   }, []);
 
+  const summary = evalData ? [
+    { name: 'Correct alerts', value: evalData.correctAlerts, color: '#16a34a' },
+    { name: 'False alerts', value: evalData.falseAlerts, color: '#dc2626' },
+    { name: 'Missed events', value: evalData.missedEvents, color: '#d97706' },
+    { name: 'Correct no-alert', value: evalData.correctNoAlert, color: '#64748b' },
+  ] : [];
+
   return (
-    <div style={{ padding: '24px', maxWidth: '1200px', margin: '0 auto' }}>
-      
-      <div style={{ marginBottom: '24px' }}>
-        <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', margin: 0 }}>
-          Historical Replay & False-Alert Evaluation
-        </h1>
-        <p style={{ fontSize: '13px', color: '#64748b', marginTop: '4px' }}>
-          Verification modules for historical flash-flood replay and prototype decision accuracy assessment.
-        </p>
+    <div style={{ padding: 24, maxWidth: 1240, margin: '0 auto' }}>
+      <div style={{ marginBottom: 20 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0 }}>Replay & False-Alert Evaluation</h1>
       </div>
 
-      {/* SECTION 1: HISTORICAL REPLAY MODE */}
-      <div className="panel-card" style={{ marginBottom: '28px', border: isReplayMode ? '2px solid #dc2626' : '1px solid #cbd5e1' }}>
-        <div className="panel-header" style={{ background: isReplayMode ? '#fef2f2' : '#fafafa', borderBottom: '1px solid #e2e8f0' }}>
-          <div className="panel-title" style={{ color: isReplayMode ? '#991b1b' : '#0f172a' }}>
-            <History size={18} style={{ color: isReplayMode ? '#dc2626' : '#64748b' }} />
-            <span>Historical Event Replay (Section 23 Specification)</span>
-          </div>
-
-          {isReplayMode ? (
-            <span style={{ fontSize: '12px', background: '#dc2626', color: 'white', fontWeight: 800, padding: '3px 10px', borderRadius: '4px', letterSpacing: '0.5px' }}>
-              REPLAYED / NOT LIVE
-            </span>
-          ) : (
-            <span style={{ fontSize: '11px', color: '#64748b' }}>
-              Current: Live Operational Baseline
-            </span>
-          )}
+      <div className="panel-card" style={{ border: isReplay ? '2px solid #dc2626' : '1px solid #cbd5e1' }}>
+        <div className="panel-header" style={{ background: isReplay ? '#fef2f2' : '#fafafa' }}>
+          <div className="panel-title" style={{ color: isReplay ? '#991b1b' : '#0f172a' }}><History size={18} /><span>Historical / replay mode</span></div>
+          {isReplay
+            ? <span style={{ fontSize: 13, background: '#dc2626', color: '#fff', fontWeight: 800, padding: '4px 12px', borderRadius: 4, letterSpacing: '0.5px' }}>REPLAYED / NOT LIVE</span>
+            : <span style={{ fontSize: 11, color: '#64748b' }}>Current mode: {systemState.mode.replace('_', ' ')}</span>}
         </div>
-
         <div className="panel-body">
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 1fr) 220px', gap: '20px', alignItems: 'center' }}>
-            <div>
-              <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>
-                Monsoon Flash Flood Surge — 15 August 2026 Replay
-              </div>
-              <p style={{ fontSize: '12px', color: '#475569', marginTop: '6px', lineHeight: 1.5 }}>
-                Simulates an extreme 175mm atmospheric river precipitation event across the Mulshi-Pawana catchment basin.
-                Observe how the downstream pipeline dynamically responds:
-                <br/>
-                <code>Rainfall ↑ → Risk ↑ → Affected Area ↑ → Priority Update → Road Invalidation → Alternative Routing</code>
-              </p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 20, flexWrap: 'wrap', alignItems: 'center' }}>
+            <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.6 }}>
+              <div><b>Event:</b> Heavy Rainfall Scenario — Mula-Pawana Basin</div>
+              <div><b>Date:</b> 15 August 2026 · <b>Mode:</b> REPLAYED DATA (reconstructed scenario)</div>
+              <div>Rainfall ↑ → Risk ↑ → Affected area ↑ → Priority → Road → Route → Resource — one frame every 4 s.</div>
             </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <button
-                onClick={onReplay}
-                className="btn btn-danger"
-                style={{ padding: '10px 14px', fontSize: '12px', justifyContent: 'center' }}
-              >
-                <Play size={14} />
-                <span>Launch 15-Aug Replay</span>
-              </button>
-
-              <button
-                onClick={onReset}
-                className="btn btn-secondary"
-                style={{ padding: '8px 12px', fontSize: '11px', justifyContent: 'center' }}
-              >
-                <RotateCcw size={13} />
-                <span>Exit Replay & Reset</span>
-              </button>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {replay?.running ? (
+                <button className="btn btn-danger" onClick={actions.stopReplay}><Square size={13} /> Pause</button>
+              ) : (
+                <button className="btn btn-danger" onClick={actions.replay} disabled={!!busy}>{busy === 'replay' ? <Loader2 size={13} className="spin" /> : <Play size={13} />} {replay ? 'Restart replay' : 'Start replay'}</button>
+              )}
+              <button className="btn btn-secondary" onClick={actions.reset} disabled={!!busy}><RotateCcw size={13} /> Exit to baseline</button>
             </div>
           </div>
 
-          {isReplayMode && (
-            <div style={{ marginTop: '16px', background: '#fee2e2', border: '1px solid #fca5a5', padding: '12px', borderRadius: '6px', color: '#991b1b', fontSize: '12px' }}>
-              ⚠️ <b>Active Replay State:</b> All dashboard values, rainfall charts, and risk numbers reflect the 15-August historical calibration dataset. Road R12 is severed by river overflow, triggering the alternative high-ridge bypass route.
-            </div>
+          {replay && (
+            <>
+              <div style={{ display: 'flex', gap: 4, margin: '14px 0 6px' }}>
+                {Array.from({ length: replay.totalFrames }).map((_, i) => (
+                  <div key={i} style={{ flex: 1, height: 6, borderRadius: 3, background: i < replay.frame ? '#dc2626' : '#e2e8f0' }} />
+                ))}
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#991b1b' }}>
+                {replay.date} {replay.frameTime} — frame {replay.frame}/{replay.totalFrames}: {replay.label}
+              </div>
+              <div style={{ height: 240, marginTop: 10 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={replay.history} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="time" tick={{ fontSize: 11 }} />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} />
+                    <Tooltip />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <ReferenceLine y={81} stroke="#dc2626" strokeDasharray="4 4" label={{ value: 'CRITICAL', fontSize: 10, fill: '#dc2626' }} />
+                    <ReferenceLine y={61} stroke="#ea580c" strokeDasharray="4 4" label={{ value: 'HIGH', fontSize: 10, fill: '#ea580c' }} />
+                    {settlements.map((s, i) => (
+                      <Line key={s.id} type="monotone" dataKey={s.id} name={`${shortName(s.name)} risk`} stroke={LINE_COLORS[i % LINE_COLORS.length]} strokeWidth={2} dot isAnimationActive={false} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </>
           )}
         </div>
       </div>
 
-      {/* SECTION 2: FALSE-ALERT EVALUATION MODULE */}
       <div className="panel-card">
         <div className="panel-header">
-          <div className="panel-title">
-            <FileCheck size={18} style={{ color: '#16a34a' }} />
-            <span>False-Alert Evaluation Module (Section 24 Specification)</span>
-          </div>
-          <span style={{ fontSize: '10px', background: '#fef3c7', color: '#92400e', fontWeight: 700, padding: '2px 8px', borderRadius: '4px' }}>
-            PROTOTYPE EVALUATION
-          </span>
+          <div className="panel-title"><FileCheck size={18} color="#16a34a" /><span>False-alert evaluation</span></div>
+          <span style={{ fontSize: 10, background: '#fef3c7', color: '#92400e', fontWeight: 700, padding: '2px 8px', borderRadius: 4 }}>SCENARIO-BASED</span>
         </div>
-
         <div className="panel-body">
-          {/* Mandatory User Prompt Disclaimer */}
-          <div style={{
-            background: '#fffbeb',
-            border: '1px solid #fde68a',
-            padding: '10px 14px',
-            borderRadius: '6px',
-            fontSize: '12px',
-            color: '#92400e',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            marginBottom: '20px'
-          }}>
-            <Info size={16} />
-            <b>Mandatory Note:</b> Prototype evaluation using simulated/replayed scenarios. Not certified real-world operational accuracy.
+          <div style={{ background: '#fffbeb', border: '1px solid #fde68a', padding: '10px 14px', borderRadius: 6, fontSize: 12, color: '#92400e', display: 'flex', gap: 8, marginBottom: 16 }}>
+            <Info size={16} style={{ flexShrink: 0 }} />
+            <span><b>Evaluation uses simulated and replayed scenarios</b>, not real-world outcomes. Each scenario is run through the same risk engine used live; an alert = HIGH or CRITICAL.</span>
           </div>
-
-          {/* Metric KPI cards */}
+          {evalError && <div style={{ color: '#dc2626', fontSize: 12 }}>Could not load evaluation: {evalError}</div>}
           {evalData && (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '14px', marginBottom: '24px' }}>
-              <div style={{ background: '#f8fafc', padding: '14px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
-                <div style={{ fontSize: '11px', color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>Total Alerts Tested</div>
-                <div style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', fontFamily: 'monospace', marginTop: '4px' }}>
-                  {evalData.totalAlerts}
-                </div>
+            <>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 16 }}>
+                {[
+                  ['Total alerts', evalData.totalAlerts, '#0f172a'],
+                  ['Correct alerts', evalData.correctAlerts, '#16a34a'],
+                  ['False alerts', evalData.falseAlerts, '#dc2626'],
+                  ['False alert rate', `${evalData.falseAlertRatePercent}%`, '#2563eb'],
+                  ['Missed events', evalData.missedEvents, '#d97706'],
+                  ['Recall', `${evalData.recallPercent}%`, '#7c3aed'],
+                ].map(([k, v, c]) => (
+                  <div key={k} style={{ background: '#f8fafc', padding: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}>
+                    <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>{k}</div>
+                    <div style={{ fontSize: 24, fontWeight: 800, color: c, fontFamily: 'monospace' }}>{v}</div>
+                  </div>
+                ))}
               </div>
-
-              <div style={{ background: '#f0fdf4', padding: '14px', borderRadius: '8px', border: '1px solid #86efac' }}>
-                <div style={{ fontSize: '11px', color: '#166534', textTransform: 'uppercase', fontWeight: 700 }}>Correct Alerts</div>
-                <div style={{ fontSize: '24px', fontWeight: 800, color: '#16a34a', fontFamily: 'monospace', marginTop: '4px' }}>
-                  {evalData.correctAlerts}
-                </div>
+              <div style={{ height: 180, marginBottom: 16 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={summary} layout="vertical" margin={{ left: 40 }}>
+                    <XAxis type="number" allowDecimals={false} tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={110} />
+                    <Tooltip />
+                    <Bar dataKey="value" radius={[0, 4, 4, 0]}>{summary.map((d) => <Cell key={d.name} fill={d.color} />)}</Bar>
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
-
-              <div style={{ background: '#fef2f2', padding: '14px', borderRadius: '8px', border: '1px solid #fca5a5' }}>
-                <div style={{ fontSize: '11px', color: '#991b1b', textTransform: 'uppercase', fontWeight: 700 }}>False Alerts</div>
-                <div style={{ fontSize: '24px', fontWeight: 800, color: '#dc2626', fontFamily: 'monospace', marginTop: '4px' }}>
-                  {evalData.falseAlerts}
-                </div>
-              </div>
-
-              <div style={{ background: '#eff6ff', padding: '14px', borderRadius: '8px', border: '1px solid #bfdbfe' }}>
-                <div style={{ fontSize: '11px', color: '#1e40af', textTransform: 'uppercase', fontWeight: 700 }}>False Alert Rate</div>
-                <div style={{ fontSize: '24px', fontWeight: 800, color: '#2563eb', fontFamily: 'monospace', marginTop: '4px' }}>
-                  {evalData.falseAlertRatePercent}%
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Sample Audit Case Table */}
-          {evalData?.sampleCases && (
-            <div>
-              <div style={{ fontSize: '13px', fontWeight: 700, color: '#0f172a', marginBottom: '10px' }}>
-                Simulated Scenario Validation Audit Cases:
-              </div>
+              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>{evalData.totalScenarios} scenarios · {evalData.evaluationDataset} · threshold: {evalData.alertThreshold}</div>
               <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px', textAlign: 'left' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                   <thead>
-                    <tr style={{ background: '#f1f5f9', borderBottom: '2px solid #cbd5e1' }}>
-                      <th style={{ padding: '8px 10px' }}>Case ID</th>
-                      <th style={{ padding: '8px 10px' }}>Location</th>
-                      <th style={{ padding: '8px 10px' }}>Sensor / Hazard Signal</th>
-                      <th style={{ padding: '8px 10px' }}>Ground Truth</th>
-                      <th style={{ padding: '8px 10px' }}>Decision Engine Output</th>
-                      <th style={{ padding: '8px 10px' }}>Verdict</th>
+                    <tr style={{ background: '#f1f5f9', textAlign: 'left' }}>
+                      {['Case', 'Location', 'Scenario', 'Signals', 'Risk', 'Engine output', 'Outcome', 'Verdict'].map((h) => <th key={h} style={{ padding: '7px 8px' }}>{h}</th>)}
                     </tr>
                   </thead>
                   <tbody>
-                    {evalData.sampleCases.map((c) => (
-                      <tr key={c.caseId} style={{ borderBottom: '1px solid #e2e8f0' }}>
-                        <td style={{ padding: '8px 10px', fontFamily: 'monospace', fontWeight: 700 }}>{c.caseId}</td>
-                        <td style={{ padding: '8px 10px', fontWeight: 600 }}>{c.location}</td>
-                        <td style={{ padding: '8px 10px', color: '#475569' }}>{c.sensorSignal}</td>
-                        <td style={{ padding: '8px 10px' }}>{c.groundTruth}</td>
-                        <td style={{ padding: '8px 10px', fontWeight: 700 }}>{c.alertDecision}</td>
-                        <td style={{ padding: '8px 10px' }}>
-                          <span style={{
-                            padding: '2px 8px',
-                            borderRadius: '4px',
-                            fontSize: '11px',
-                            fontWeight: 700,
-                            background: c.verdict === 'CORRECT_DETECTION' ? '#dcfce7' : '#fee2e2',
-                            color: c.verdict === 'CORRECT_DETECTION' ? '#166534' : '#991b1b'
-                          }}>
-                            {c.verdict.replace('_', ' ')}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                    {evalData.cases.map((c) => {
+                      const [bg, fg, label] = VERDICT[c.verdict];
+                      return (
+                        <tr key={c.caseId} style={{ borderBottom: '1px solid #e2e8f0' }}>
+                          <td style={{ padding: '6px 8px', fontFamily: 'monospace' }}>{c.caseId}</td>
+                          <td style={{ padding: '6px 8px' }}>{c.location}</td>
+                          <td style={{ padding: '6px 8px', color: '#475569' }}>{c.scenario}</td>
+                          <td style={{ padding: '6px 8px', color: '#475569' }}>{c.signal}</td>
+                          <td style={{ padding: '6px 8px', fontFamily: 'monospace' }}>{c.riskScore}</td>
+                          <td style={{ padding: '6px 8px', fontWeight: 700 }}>{c.alertDecision}</td>
+                          <td style={{ padding: '6px 8px' }}>{c.observed.replace('_', ' ')}</td>
+                          <td style={{ padding: '6px 8px' }}><span style={{ padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 700, background: bg, color: fg }}>{label}</span></td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
-            </div>
+            </>
           )}
         </div>
       </div>
-
     </div>
   );
 }

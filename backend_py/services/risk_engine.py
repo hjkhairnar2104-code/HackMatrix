@@ -1,105 +1,130 @@
-from typing import Dict, Any, Tuple, List
+"""
+Explainable Flood Risk Engine (0-100).
 
-def calculate_flood_risk(
-    rainfall_mm: float,
-    elevation_m: float,
-    water_level_status: str,
-    ground_reports_count: int,
-    accessibility: str,
-    population: int
-) -> Tuple[int, str, List[str]]:
+Weighted scoring model. Every factor reports its own points so the UI can show
+exactly why a settlement received its score.
+"""
+from typing import Any, Dict, List
+
+WEIGHTS = {
+    "rainfall": 28,        # 24h accumulation
+    "intensity": 10,       # peak mm/h
+    "terrain": 20,         # height above river datum, gated by active water hazard
+    "waterLevel": 22,      # river gauge
+    "groundReports": 10,   # severity-weighted field reports
+    "population": 5,       # exposure
+    "accessibility": 5,    # isolation amplifies vulnerability
+}
+
+SEVERITY_WEIGHT = {"LOW": 0.3, "MODERATE": 0.6, "HIGH": 1.0, "CRITICAL": 1.4}
+ACCESS_WEIGHT = {"OPEN": 0.0, "AT_RISK": 0.6, "CUT_OFF": 1.0}
+
+
+def classify_risk(score: int) -> str:
+    if score >= 81:
+        return "CRITICAL"
+    if score >= 61:
+        return "HIGH"
+    if score >= 31:
+        return "MODERATE"
+    return "LOW"
+
+
+def _clamp(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def report_load(reports: List[Dict[str, Any]]) -> float:
+    return sum(SEVERITY_WEIGHT.get((r.get("severity") or "MODERATE").upper(), 0.6) for r in reports)
+
+
+def calculate_flood_risk(s: Dict[str, Any], reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rain = s["rainfall"]
+    intensity = s["rainfallIntensity"]
+    rel_elev = s["relativeElevation"]
+    level_m = s["waterLevelMeters"]
+
+    rain_f = _clamp(rain / 140.0)
+    intensity_f = _clamp(intensity / 25.0)
+    level_f = _clamp((level_m - 0.6) / 1.5)
+    terrain_vuln = _clamp((40.0 - rel_elev) / 34.0)
+    # Low ground only matters when water is actually present
+    hazard_gate = _clamp(0.3 + max(rain_f, level_f))
+    reports_f = _clamp(report_load(reports) / 2.0)
+    pop_f = _clamp(s["population"] / 4000.0)
+    access_f = ACCESS_WEIGHT.get(s.get("accessibility", "OPEN"), 0.0)
+
+    factors = [
+        {
+            "key": "rainfall", "label": "Rainfall (24h)",
+            "points": WEIGHTS["rainfall"] * rain_f,
+            "detail": f"{rain:.0f} mm accumulated in 24h",
+            "evidence": ("Heavy rainfall" if rain >= 100 else "Moderate rainfall") + f" ({rain:.0f} mm/24h)",
+        },
+        {
+            "key": "intensity", "label": "Rainfall intensity",
+            "points": WEIGHTS["intensity"] * intensity_f,
+            "detail": f"{intensity:.0f} mm/h peak",
+            "evidence": f"High rainfall intensity ({intensity:.0f} mm/h)",
+        },
+        {
+            "key": "terrain", "label": "Terrain / elevation",
+            "points": WEIGHTS["terrain"] * terrain_vuln * hazard_gate,
+            "detail": f"{rel_elev:.0f} m above river ({s['elevation']:.0f} m ASL, {s['terrainClass'].replace('_', ' ').lower()})",
+            "evidence": f"Low elevation — {rel_elev:.0f} m above river level",
+        },
+        {
+            "key": "waterLevel", "label": "Water-level indicator",
+            "points": WEIGHTS["waterLevel"] * level_f,
+            "detail": f"Gauge {level_m:.2f} m ({s['waterLevel']})",
+            "evidence": f"Water level {s['waterLevel']} ({level_m:.2f} m)",
+        },
+        {
+            "key": "groundReports", "label": "Ground reports",
+            "points": WEIGHTS["groundReports"] * reports_f,
+            "detail": f"{len(reports)} report(s)",
+            "evidence": f"{len(reports)} ground report(s) received",
+        },
+        {
+            "key": "population", "label": "Population exposure",
+            "points": WEIGHTS["population"] * pop_f,
+            "detail": f"{s['population']:,} residents",
+            "evidence": f"High population exposure ({s['population']:,} people)",
+        },
+        {
+            "key": "accessibility", "label": "Road accessibility",
+            "points": WEIGHTS["accessibility"] * access_f,
+            "detail": s.get("accessibility", "OPEN").replace("_", " "),
+            "evidence": "Road accessibility reduced" if access_f < 1 else "Settlement cut off by road closures",
+        },
+    ]
+
+    for f in factors:
+        f["maxPoints"] = WEIGHTS[f["key"]]
+        f["points"] = round(f["points"], 1)
+        # A factor counts as evidence when it delivers at least 40% of its weight
+        f["contributing"] = f["points"] >= 0.4 * f["maxPoints"]
+
+    score = int(round(min(100.0, sum(f["points"] for f in factors))))
+    return {
+        "riskScore": score,
+        "riskStatus": classify_risk(score),
+        "riskFactors": factors,
+        "evidence": [f["evidence"] for f in factors if f["contributing"]],
+    }
+
+
+def risk_confidence(s: Dict[str, Any], reports: List[Dict[str, Any]], weather_live: bool) -> float:
     """
-    Explainable Flood Risk Scoring Model (0 - 100)
-    Factors:
-    - Rainfall (0 - 35 pts)
-    - Elevation Vulnerability (0 - 25 pts)
-    - Water Level Gauge (0 - 20 pts)
-    - Ground Distress Reports (0 - 20 pts)
+    Confidence reflects how many independent signal families agree, the AI
+    extraction confidence of supporting reports, and data quality.
     """
-    factors = []
-
-    # 1. Rainfall score (max 35)
-    if rainfall_mm >= 140:
-        rf_score = 35
-        factors.append(f"Torrential rainfall accumulation ({rainfall_mm:.1f} mm)")
-    elif rainfall_mm >= 90:
-        rf_score = 28
-        factors.append(f"Heavy rainfall intensity ({rainfall_mm:.1f} mm)")
-    elif rainfall_mm >= 50:
-        rf_score = 18
-        factors.append(f"Moderate persistent rainfall ({rainfall_mm:.1f} mm)")
-    elif rainfall_mm >= 25:
-        rf_score = 10
-        factors.append(f"Light baseline showers ({rainfall_mm:.1f} mm)")
-    elif rainfall_mm > 5:
-        rf_score = 4
-        factors.append(f"Minor localized precipitation ({rainfall_mm:.1f} mm)")
-    else:
-        rf_score = 0
-        factors.append(f"Dry weather / No active precipitation ({rainfall_mm:.1f} mm)")
-
-    # 2. Elevation vulnerability (max 25)
-    # Low ground is only a danger IF rain or river water is actively present!
-    has_water_hazard = (rainfall_mm >= 25) or (water_level_status.upper() in ["WARNING", "CRITICAL"])
-    if has_water_hazard:
-        if elevation_m <= 40:
-            elev_score = 25
-            factors.append(f"Extreme low-elevation depression ({elevation_m:.0f}m - basin floor collecting runoff)")
-        elif elevation_m <= 50:
-            elev_score = 18
-            factors.append(f"Low-lying river plain terrain ({elevation_m:.0f}m - flood prone)")
-        elif elevation_m <= 70:
-            elev_score = 10
-            factors.append(f"Moderate elevation plateau ({elevation_m:.0f}m)")
-        else:
-            elev_score = 2
-            factors.append(f"High ground elevation ({elevation_m:.0f}m - natural buffer)")
-    else:
-        elev_score = 2 if elevation_m <= 45 else 0
-        factors.append(f"Topography stable at {elevation_m:.0f}m (no active inundation)")
-
-    # 3. Water level indicator (max 20)
-    wl_upper = water_level_status.upper()
-    if wl_upper == "CRITICAL":
-        wl_score = 20
-        factors.append("River gauge crossed CRITICAL flood threshold (>2.2m)")
-    elif wl_upper == "WARNING":
-        wl_score = 14
-        factors.append("River gauge active in WARNING zone (>1.6m)")
-    else:
-        wl_score = 0
-        factors.append("River stream water level within normal seasonal banks (<1.0m)")
-
-    # 4. Ground reports (max 20)
-    if ground_reports_count >= 3:
-        rep_score = 20
-        factors.append(f"Multiple confirmed ground distress reports ({ground_reports_count})")
-    elif ground_reports_count == 2:
-        rep_score = 14
-        factors.append(f"2 verified ground reports of street inundation")
-    elif ground_reports_count == 1:
-        rep_score = 8
-        factors.append(f"1 field report logged by citizen/ward officer")
-    else:
-        rep_score = 0
-
-    # Isolation booster: if road is completely cut off, vulnerability amplifies
-    if accessibility == "CUT_OFF":
-        factors.append("Settlement road access severed (isolation amplification)")
-        isolation_bonus = 6
-    else:
-        isolation_bonus = 0
-
-    total_score = min(100, rf_score + elev_score + wl_score + rep_score + isolation_bonus)
-
-    # Classification
-    if total_score >= 81:
-        status = "CRITICAL"
-    elif total_score >= 61:
-        status = "HIGH"
-    elif total_score >= 31:
-        status = "MODERATE"
-    else:
-        status = "LOW"
-
-    return total_score, status, factors
+    agreeing = sum(1 for f in s["riskFactors"] if f["contributing"] and f["key"] in ("rainfall", "intensity", "terrain", "waterLevel", "groundReports", "accessibility"))
+    signal_conf = min(0.95, 0.55 + 0.075 * agreeing)
+    if reports:
+        report_conf = sum((r.get("extractedInfo") or {}).get("confidence", 0.8) for r in reports) / len(reports)
+        signal_conf = 0.75 * signal_conf + 0.25 * report_conf
+    signal_conf -= 0.03 * len(s.get("imputedFields", []))
+    if weather_live:
+        signal_conf += 0.01
+    return round(max(0.4, min(0.97, signal_conf)), 2)

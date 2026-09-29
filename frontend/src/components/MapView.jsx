@@ -1,358 +1,188 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
+import { RISK_COLORS, ROAD_COLORS, RESOURCE_ICONS, shortName } from '../utils';
 
-export default function MapView({ 
-  settlements = [], 
-  roads = [], 
-  resources = [], 
-  route = null, 
-  onSelectSettlement = null,
-  height = '520px'
-}) {
-  const mapContainerRef = useRef(null);
-  const mapInstanceRef = useRef(null);
-  const layerGroupRef = useRef(null);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-  // Initialize Map
+function settlementPopup(s) {
+  const color = RISK_COLORS[s.riskStatus];
+  const row = (k, v) => `<div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:3px"><span>${k}</span><b>${v}</b></div>`;
+  return `
+    <div style="font-family:Inter,sans-serif;font-size:12px;min-width:240px;line-height:1.4">
+      <div style="font-size:14px;font-weight:800;border-bottom:1px solid #e2e8f0;padding-bottom:4px;margin-bottom:6px">${esc(s.name)}</div>
+      ${row('Population', s.population.toLocaleString())}
+      ${row('Rainfall (24h)', `${s.rainfall} mm · ${s.rainfallIntensity} mm/h`)}
+      ${row('Elevation', `${s.elevation} m ASL (${s.relativeElevation} m above river)`)}
+      ${row('Water level', `${s.waterLevelMeters} m (${s.waterLevel})`)}
+      ${row('Risk score', `<span style="color:${color}">${s.riskScore}/100 ${s.riskStatus}</span>`)}
+      ${row('Priority', `#${s.priorityRank} (${s.responsePriority})`)}
+      ${row('Road access', `<span style="color:${s.accessibility === 'OPEN' ? '#16a34a' : s.accessibility === 'CUT_OFF' ? '#dc2626' : '#d97706'}">${s.accessibility.replace('_', ' ')}</span>`)}
+      ${row('Confidence', `${Math.round(s.riskConfidence * 100)}%`)}
+      <div style="background:#f8fafc;padding:6px;border-radius:4px;border:1px solid #e2e8f0;margin-top:4px">
+        <b>Evidence</b>
+        <ul style="margin:4px 0 0 14px;padding:0">${(s.evidence || []).map((e) => `<li>${esc(e)}</li>`).join('') || '<li>No strong flood signals</li>'}</ul>
+      </div>
+    </div>`;
+}
+
+export default function MapView({ systemState, onSelectSettlement = null, height = '520px', focusSettlementId = null }) {
+  const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const layerRef = useRef(null);
+  const [tilesOffline, setTilesOffline] = useState(false);
+
   useEffect(() => {
-    if (!mapContainerRef.current) return;
-
-    if (!mapInstanceRef.current) {
-      // Center on Pune District (Mula-Pawana-Mutha basin)
-      const map = L.map(mapContainerRef.current, {
-        center: [18.5780, 73.7950],
-        zoom: 13,
-        zoomControl: true
-      });
-
-      // Dark / OpenStreetMap clean tile layer
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors | ResQGrid Decision Platform',
-        maxZoom: 18,
-      }).addTo(map);
-
-      layerGroupRef.current = L.layerGroup().addTo(map);
-      mapInstanceRef.current = map;
-    }
-
+    if (!containerRef.current || mapRef.current) return undefined;
+    const map = L.map(containerRef.current, { center: [18.578, 73.792], zoom: 13 });
+    let errors = 0;
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 18,
+    })
+      .on('tileerror', () => { errors += 1; if (errors > 3) setTilesOffline(true); })
+      .on('tileload', () => { errors = 0; setTilesOffline(false); })
+      .addTo(map);
+    layerRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
     return () => {
-      // Cleanup if unmounted
-      if (mapInstanceRef.current) {
-        mapInstanceRef.current.remove();
-        mapInstanceRef.current = null;
-      }
+      map.remove();
+      mapRef.current = null;
     };
   }, []);
 
-  // Update Layers when data changes
   useEffect(() => {
-    if (!mapInstanceRef.current || !layerGroupRef.current) return;
+    const map = mapRef.current;
+    const layer = layerRef.current;
+    if (!map || !layer || !systemState) return;
+    layer.clearLayers();
+    const { settlements = [], roads = [], resources = [], routes = [], nodes: bases = [] } = systemState;
+    const boundary = systemState.district?.boundary;
 
-    const layerGroup = layerGroupRef.current;
-    layerGroup.clearLayers();
-
-    // 1. Draw Roads
-    roads.forEach((road) => {
-      if (!road.coordinates || road.coordinates.length < 2) return;
-
-      let color = '#10b981'; // OPEN (green)
-      let dashArray = null;
-      let weight = 4;
-      let opacity = 0.8;
-
-      if (road.status === 'BLOCKED') {
-        color = '#ef4444'; // BLOCKED (red)
-        dashArray = '6, 6';
-        weight = 5;
-        opacity = 0.95;
-      } else if (road.status === 'AT_RISK') {
-        color = '#f59e0b'; // AT RISK (orange)
-        weight = 4;
-      }
-
-      const polyline = L.polyline(road.coordinates, {
-        color,
-        weight,
-        dashArray,
-        opacity
-      });
-
-      polyline.bindPopup(`
-        <div style="font-family: sans-serif; font-size: 12px; line-height: 1.4;">
-          <strong style="font-size: 13px;">${road.name}</strong><br/>
-          <span>Status: </span><b style="color: ${color}">${road.status}</b><br/>
-          <span>Distance: ${road.distanceKm} km</span><br/>
-          <span>Accessibility: ${road.accessibility}</span>
-        </div>
-      `);
-
-      layerGroup.addLayer(polyline);
-
-      // If blocked, put a blockage icon at midpoint
-      if (road.status === 'BLOCKED') {
-        const midIdx = Math.floor(road.coordinates.length / 2);
-        const midCoord = road.coordinates[midIdx];
-        const blockIcon = L.divIcon({
-          className: 'custom-road-block-marker',
-          html: `<div style="background: #dc2626; color: white; border: 2px solid white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.3);">✕</div>`,
-          iconSize: [24, 24],
-          iconAnchor: [12, 12]
-        });
-        const blockMarker = L.marker(midCoord, { icon: blockIcon });
-        blockMarker.bindPopup(`<b>ROAD BLOCKED</b><br/>${road.name} is submerged.`);
-        layerGroup.addLayer(blockMarker);
-      }
-    });
-
-    // 2. Draw Active Rescue Routes
-    if (route) {
-      // Original Route
-      if (route.originalCoordinates && route.originalCoordinates.length >= 2) {
-        const isInvalid = route.originalRouteStatus === 'INVALID';
-        const origPoly = L.polyline(route.originalCoordinates, {
-          color: isInvalid ? '#dc2626' : '#2563eb',
-          weight: 6,
-          dashArray: isInvalid ? '8, 8' : null,
-          opacity: isInvalid ? 0.7 : 0.9
-        });
-        origPoly.bindPopup(`
-          <div style="font-family: sans-serif; font-size: 12px;">
-            <strong>Original Route</strong><br/>
-            Status: <b style="color: ${isInvalid ? '#dc2626' : '#16a34a'}">${route.originalRouteStatus}</b><br/>
-            ${isInvalid ? '⚠️ Compromised by flood blockage on R12' : 'Direct emergency corridor open'}
-          </div>
-        `);
-        layerGroup.addLayer(origPoly);
-      }
-
-      // Alternative Route (if available)
-      if (route.alternativeCoordinates && route.alternativeCoordinates.length >= 2) {
-        const altPoly = L.polyline(route.alternativeCoordinates, {
-          color: '#2563eb',
-          weight: 6,
-          opacity: 0.95
-        });
-        altPoly.bindPopup(`
-          <div style="font-family: sans-serif; font-size: 12px;">
-            <strong style="color: #2563eb;">✓ Alternative Route (High-Ridge Bypass)</strong><br/>
-            Status: <b>VALID (ACTIVE DIVERSION)</b><br/>
-            Distance: ${route.distanceKm} km | ETA: ${route.etaMinutes} min<br/>
-            <span>Clearance: Elevated ridge terrain avoids flood inundation.</span>
-          </div>
-        `);
-        layerGroup.addLayer(altPoly);
-      }
+    // District boundary (local geometry — renders even without tiles)
+    if (boundary) {
+      layer.addLayer(L.polygon(boundary, { color: '#334155', weight: 1.5, dashArray: '4 4', fill: false, interactive: false }));
     }
 
-    // 3. Draw Settlements
+    // Risk areas
     settlements.forEach((s) => {
-      let pinColor = '#16a34a';
-      let haloClass = '';
-      if (s.riskStatus === 'CRITICAL') {
-        pinColor = '#dc2626';
-        haloClass = 'pulse-ring-critical';
-      } else if (s.riskStatus === 'HIGH') {
-        pinColor = '#ea580c';
-        haloClass = 'pulse-ring-high';
-      } else if (s.riskStatus === 'MODERATE') {
-        pinColor = '#d97706';
+      const color = RISK_COLORS[s.riskStatus];
+      layer.addLayer(L.circle([s.latitude, s.longitude], {
+        radius: 350 + s.riskScore * 10, color, fillColor: color, weight: 1,
+        fillOpacity: s.riskStatus === 'CRITICAL' ? 0.25 : s.riskStatus === 'HIGH' ? 0.18 : 0.1, interactive: false,
+      }));
+    });
+
+    // Roads
+    roads.forEach((road) => {
+      const color = ROAD_COLORS[road.status];
+      const line = L.polyline(road.coordinates, {
+        color, weight: road.status === 'OPEN' ? 4 : 5, opacity: 0.85, dashArray: road.status === 'BLOCKED' ? '6 6' : null,
+      });
+      line.bindPopup(`<div style="font-size:12px"><b>${esc(road.name)} (${road.id})</b><br/>${esc(road.sourceName)} ↔ ${esc(road.destinationName)}<br/>
+        Status: <b style="color:${color}">${road.status.replace('_', ' ')}</b> · ${road.distanceKm} km<br/><i>${esc(road.statusReason)}</i></div>`);
+      layer.addLayer(line);
+      const mid = road.coordinates[Math.floor(road.coordinates.length / 2)];
+      layer.addLayer(L.marker(mid, {
+        interactive: false,
+        icon: L.divIcon({
+          className: '',
+          html: `<div style="background:${road.status === 'BLOCKED' ? '#dc2626' : '#0f172a'};color:#fff;font-size:9px;font-weight:800;padding:1px 4px;border-radius:3px;border:1px solid ${color};white-space:nowrap">${road.status === 'BLOCKED' ? '✕ ' : ''}${road.id}</div>`,
+          iconSize: [30, 14], iconAnchor: [15, 7],
+        }),
+      }));
+    });
+
+    // Response routes (original, and alternative when rerouted)
+    routes.forEach((route) => {
+      if (route.originalCoordinates?.length > 1) {
+        const invalid = route.originalRouteStatus === 'INVALID';
+        const line = L.polyline(route.originalCoordinates, {
+          color: invalid ? '#991b1b' : '#2563eb', weight: invalid ? 3 : 7, opacity: invalid ? 0.9 : 0.55, dashArray: invalid ? '2 8' : null,
+        });
+        line.bindPopup(`<div style="font-size:12px"><b>${esc(route.resourceName)} → ${esc(shortName(route.targetSettlementName))}</b><br/>
+          Original route: <b style="color:${invalid ? '#dc2626' : '#16a34a'}">${route.originalRouteStatus}</b> (${route.originalRoadIds.join(' → ')})<br/>${esc(route.explanation)}</div>`);
+        layer.addLayer(line);
       }
-
-      // Translucent risk circle buffer
-      const circle = L.circle([s.latitude, s.longitude], {
-        radius: s.riskStatus === 'CRITICAL' ? 1200 : 800,
-        color: pinColor,
-        fillColor: pinColor,
-        fillOpacity: s.riskStatus === 'CRITICAL' ? 0.22 : 0.12,
-        weight: 1
-      });
-      layerGroup.addLayer(circle);
-
-      // Custom Settlement Marker with Priority Rank
-      const icon = L.divIcon({
-        className: 'custom-settlement-icon',
-        html: `
-          <div style="position: relative; cursor: pointer;">
-            <div style="
-              background: ${pinColor}; 
-              color: white; 
-              border: 2px solid #ffffff; 
-              border-radius: 50%; 
-              width: 32px; 
-              height: 32px; 
-              display: flex; 
-              flex-direction: column;
-              align-items: center; 
-              justify-content: center; 
-              font-size: 11px; 
-              font-weight: 800; 
-              box-shadow: 0 4px 8px rgba(0,0,0,0.3);
-            ">
-              #${s.priorityRank || 1}
-            </div>
-            <div style="
-              background: rgba(15, 23, 42, 0.85); 
-              color: #ffffff; 
-              font-size: 10px; 
-              font-weight: 700; 
-              padding: 2px 6px; 
-              border-radius: 4px; 
-              position: absolute; 
-              top: 34px; 
-              left: 50%; 
-              transform: translateX(-50%); 
-              white-space: nowrap;
-              border: 1px solid rgba(255,255,255,0.2);
-            ">
-              ${s.name.split(' ')[0]} ${s.name.split(' ')[1] || ''}
-            </div>
-          </div>
-        `,
-        iconSize: [32, 32],
-        iconAnchor: [16, 16]
-      });
-
-      const marker = L.marker([s.latitude, s.longitude], { icon });
-
-      marker.on('click', () => {
-        if (onSelectSettlement) onSelectSettlement(s);
-      });
-
-      marker.bindPopup(`
-        <div style="font-family: sans-serif; font-size: 12px; min-width: 220px; line-height: 1.4;">
-          <div style="font-size: 14px; font-weight: 800; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-bottom: 6px;">
-            ${s.name}
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-            <span>Response Priority:</span> 
-            <b style="color: #2563eb;">#${s.priorityRank} (${s.responsePriority}/100)</b>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-            <span>Flood Risk:</span> 
-            <b style="color: ${pinColor}">${s.riskScore}/100 (${s.riskStatus})</b>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-            <span>Population Exposed:</span> 
-            <b>${s.population.toLocaleString()}</b>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-            <span>Elevation:</span> 
-            <b>${s.elevation} m</b>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-            <span>Water Level Gauge:</span> 
-            <b>${s.waterLevelMeters} m (${s.waterLevel})</b>
-          </div>
-          <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
-            <span>Road Access:</span> 
-            <b style="color: ${s.accessibility === 'CUT_OFF' ? '#dc2626' : '#16a34a'}">${s.accessibility}</b>
-          </div>
-          <div style="background: #f8fafc; padding: 6px; border-radius: 4px; font-size: 11px; border: 1px solid #e2e8f0;">
-            <b>Contributing Evidence:</b>
-            <ul style="margin: 4px 0 0 14px; padding: 0;">
-              ${(s.whyExplanation || []).slice(0, 3).map(e => `<li>${e}</li>`).join('')}
-            </ul>
-          </div>
-        </div>
-      `);
-
-      layerGroup.addLayer(marker);
+      if (route.alternativeCoordinates?.length > 1) {
+        const alt = L.polyline(route.alternativeCoordinates, { color: '#2563eb', weight: 7, opacity: 0.6 });
+        alt.bindPopup(`<div style="font-size:12px"><b style="color:#2563eb">✓ Alternative route VALID</b><br/>${esc(route.resourceName)} → ${esc(shortName(route.targetSettlementName))}<br/>
+          ${route.alternativeRoadIds.join(' → ')} · ${route.distanceKm} km · ETA ${route.etaMinutes} min</div>`);
+        layer.addLayer(alt);
+      }
     });
 
-    // 4. Draw Emergency Resources
+    // Bases
+    bases.forEach((b) => {
+      layer.addLayer(L.circleMarker([b.latitude, b.longitude], { radius: 5, color: '#0f172a', fillColor: '#38bdf8', fillOpacity: 1, weight: 2 })
+        .bindTooltip(b.name));
+    });
+
+    // Settlements
+    settlements.forEach((s) => {
+      const color = RISK_COLORS[s.riskStatus];
+      const focused = s.id === focusSettlementId;
+      const marker = L.marker([s.latitude, s.longitude], {
+        zIndexOffset: 1000,
+        icon: L.divIcon({
+          className: '',
+          html: `<div style="position:relative">
+            <div style="background:${color};color:#fff;border:${focused ? 3 : 2}px solid ${focused ? '#0f172a' : '#fff'};border-radius:50%;width:32px;height:32px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;box-shadow:0 4px 8px rgba(0,0,0,.3)">#${s.priorityRank}</div>
+            <div style="background:rgba(15,23,42,.88);color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;position:absolute;top:34px;left:50%;transform:translateX(-50%);white-space:nowrap">${esc(shortName(s.name))} · ${s.riskScore}</div>
+          </div>`,
+          iconSize: [32, 32], iconAnchor: [16, 16],
+        }),
+      });
+      marker.bindPopup(settlementPopup(s), { maxWidth: 320 });
+      marker.on('click', () => onSelectSettlement && onSelectSettlement(s.id));
+      layer.addLayer(marker);
+    });
+
+    // Resources
     resources.forEach((res) => {
-      let iconSymbol = '🚒';
-      if (res.type === 'RESCUE_BOAT') iconSymbol = '🚤';
-      if (res.type === 'AMBULANCE') iconSymbol = '🚑';
-      if (res.type === 'HOSPITAL') iconSymbol = '🏥';
-      if (res.type === 'SHELTER') iconSymbol = '🏠';
-
-      const resIcon = L.divIcon({
-        className: 'custom-resource-marker',
-        html: `
-          <div style="
-            background: #1e293b; 
-            border: 2px solid #38bdf8; 
-            border-radius: 8px; 
-            width: 30px; 
-            height: 30px; 
-            display: flex; 
-            align-items: center; 
-            justify-content: center; 
-            font-size: 15px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
-          ">
-            ${iconSymbol}
-          </div>
-        `,
-        iconSize: [30, 30],
-        iconAnchor: [15, 15]
+      const statusColor = { AVAILABLE: '#16a34a', DEPLOYED: '#2563eb', BUSY: '#d97706', UNAVAILABLE: '#64748b' }[res.status];
+      const m = L.marker([res.latitude, res.longitude], {
+        icon: L.divIcon({
+          className: '',
+          html: `<div style="background:#1e293b;border:2px solid ${statusColor};border-radius:8px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 2px 6px rgba(0,0,0,.4)">${RESOURCE_ICONS[res.type] || '📍'}</div>`,
+          iconSize: [30, 30], iconAnchor: [15, 15],
+        }),
       });
-
-      const resMarker = L.marker([res.latitude, res.longitude], { icon: resIcon });
-      resMarker.bindPopup(`
-        <div style="font-family: sans-serif; font-size: 12px;">
-          <strong style="color: #0284c7;">${res.name}</strong><br/>
-          <span>Type: ${res.type}</span><br/>
-          <span>Base: ${res.locationName}</span><br/>
-          <span>Status: <b style="color: #16a34a">${res.status}</b></span>
-        </div>
-      `);
-      layerGroup.addLayer(resMarker);
+      m.bindPopup(`<div style="font-size:12px"><b>${esc(res.name)}</b><br/>${res.type.replace('_', ' ')} · ${esc(res.locationName)}<br/>Status: <b style="color:${statusColor}">${res.status}</b></div>`);
+      layer.addLayer(m);
     });
+  }, [systemState, focusSettlementId, onSelectSettlement]);
 
-  }, [settlements, roads, resources, route]);
+  const legend = [
+    ['dot', RISK_COLORS.CRITICAL, 'Critical'], ['dot', RISK_COLORS.HIGH, 'High'], ['dot', RISK_COLORS.MODERATE, 'Moderate'], ['dot', RISK_COLORS.LOW, 'Low'],
+    ['line', ROAD_COLORS.OPEN, 'Road open'], ['line', ROAD_COLORS.AT_RISK, 'Road at risk'], ['line', ROAD_COLORS.BLOCKED, 'Road blocked'],
+    ['route', '#2563eb', 'Active route'], ['dash', '#991b1b', 'Invalid route'],
+  ];
 
   return (
     <div style={{ position: 'relative', width: '100%', height }}>
-      <div 
-        ref={mapContainerRef} 
-        style={{ width: '100%', height: '100%', borderRadius: '10px' }} 
-      />
-
-      {/* Map Legend Floating Widget */}
-      <div style={{
-        position: 'absolute',
-        bottom: '16px',
-        left: '16px',
-        background: 'rgba(15, 23, 42, 0.92)',
-        color: 'white',
-        padding: '10px 14px',
-        borderRadius: '8px',
-        fontSize: '11px',
-        zIndex: 500,
-        boxShadow: '0 4px 10px rgba(0,0,0,0.3)',
-        border: '1px solid rgba(255,255,255,0.15)',
-        backdropFilter: 'blur(4px)'
-      }}>
-        <div style={{ fontWeight: 700, marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.5px', color: '#94a3b8' }}>
-          GIS Map Layers
+      <div ref={containerRef} style={{ width: '100%', height: '100%', background: '#e2e8f0' }} />
+      {tilesOffline && (
+        <div style={{ position: 'absolute', top: 12, right: 12, zIndex: 500, background: '#fef3c7', color: '#92400e', border: '1px solid #f59e0b', padding: '6px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600 }}>
+          Map tiles offline — showing local district geometry only
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '6px 12px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: '#dc2626', display: 'inline-block' }}></span>
-            <span>Critical Flood Risk</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: '#ea580c', display: 'inline-block' }}></span>
-            <span>High Risk Area</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '12px', height: '3px', background: '#10b981', display: 'inline-block' }}></span>
-            <span>Road: OPEN</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '12px', height: '3px', background: '#ef4444', display: 'inline-block' }}></span>
-            <span>Road: BLOCKED</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '12px', height: '4px', background: '#2563eb', display: 'inline-block' }}></span>
-            <span>Alternative Route</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span>🚤 / 🚑</span>
-            <span>Rescue Units</span>
-          </div>
+      )}
+      <div style={{
+        position: 'absolute', bottom: 16, left: 16, zIndex: 500, background: 'rgba(15,23,42,0.92)', color: '#fff',
+        padding: '10px 12px', borderRadius: 8, fontSize: 11, border: '1px solid rgba(255,255,255,0.15)',
+      }}>
+        <div style={{ fontWeight: 700, marginBottom: 6, textTransform: 'uppercase', color: '#94a3b8', letterSpacing: '0.5px' }}>Map legend</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, auto)', gap: '4px 14px' }}>
+          {legend.map(([kind, color, label]) => (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {kind === 'dot' && <span style={{ width: 10, height: 10, borderRadius: '50%', background: color }} />}
+              {kind === 'line' && <span style={{ width: 14, height: 3, background: color }} />}
+              {kind === 'route' && <span style={{ width: 14, height: 5, background: color, opacity: 0.7 }} />}
+              {kind === 'dash' && <span style={{ width: 14, height: 0, borderTop: `3px dotted ${color}` }} />}
+              <span>{label}</span>
+            </div>
+          ))}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span>🚤🚑🚒</span><span>Resources</span></div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span>🏥🏠</span><span>Hospital / shelter</span></div>
         </div>
       </div>
     </div>

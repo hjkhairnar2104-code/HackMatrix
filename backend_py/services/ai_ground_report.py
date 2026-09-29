@@ -1,15 +1,26 @@
+"""
+LLM layer (Gemini) — used ONLY for:
+  1. extracting structured fields from free-text ground reports
+  2. phrasing explanations from structured system facts
+
+It never computes risk, priority, routes or resource decisions. Every Gemini
+output is validated; on failure a deterministic parser / template is used.
+"""
+import json
 import os
 import re
-import json
+from typing import Any, Dict, List
+
 import requests
-from typing import Dict, Any
+
+GEMINI_MODEL = "gemini-2.5-flash"
+SEVERITIES = ["LOW", "MODERATE", "HIGH", "CRITICAL"]
+ROAD_STATUSES = ["OPEN", "AT_RISK", "BLOCKED"]
+INFRASTRUCTURE = ["BRIDGE", "ROAD", "EMBANKMENT", "DRAINAGE", "HOUSING", "SCHOOL", "HOSPITAL", "OTHER"]
+
 
 def _load_env_if_needed():
-    for p in [
-        os.path.join(os.path.dirname(__file__), "..", ".env"),
-        os.path.join(os.getcwd(), ".env"),
-        os.path.join(os.getcwd(), "backend_py", ".env")
-    ]:
+    for p in [os.path.join(os.path.dirname(__file__), "..", ".env"), os.path.join(os.getcwd(), ".env")]:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
@@ -21,176 +32,186 @@ def _load_env_if_needed():
             except Exception:
                 pass
 
-_load_env_if_needed()
 
-CUSTOM_API_KEYS = {
-    "gemini": os.environ.get("GEMINI_API_KEY", "")
-}
+_load_env_if_needed()
+CUSTOM_API_KEYS = {"gemini": os.environ.get("GEMINI_API_KEY", "")}
+
 
 def set_gemini_api_key(key: str):
     CUSTOM_API_KEYS["gemini"] = key.strip()
 
+
 def get_gemini_api_key() -> str:
     return CUSTOM_API_KEYS.get("gemini") or os.environ.get("GEMINI_API_KEY", "")
 
-def extract_ground_report_info(text: str, user_location: str = "", user_severity: str = "") -> Dict[str, Any]:
-    """
-    Extracts structured data from ground report text.
-    Calls Gemini 2.5 Flash / Flash Latest when available, with instant local NLP fallback.
-    """
-    api_key = get_gemini_api_key()
 
-    if api_key:
-        try:
-            prompt = f"""
-You are an emergency disaster response intelligence parser for ResQGrid.
-Analyze this ground hazard report: "{text}"
-Target district: Pune District (Mula-Pawana-Mutha basin). Settlements: Village A (Wakad), Village B (Sangvi), Village C (Hinjawadi), Village D (Baner), Village E (Dapodi).
+def _gemini(prompt: str, json_mode: bool, timeout: float, max_tokens: int = 400) -> str:
+    key = get_gemini_api_key()
+    if not key:
+        raise RuntimeError("no key")
+    config = {"temperature": 0.1, "maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}}
+    if json_mode:
+        config["responseMimeType"] = "application/json"
+    res = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": key},
+        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": config},
+        timeout=timeout,
+    )
+    if res.status_code != 200:
+        # Never log the URL/headers: they carry the API key
+        raise RuntimeError(f"Gemini HTTP {res.status_code}")
+    return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-Return ONLY a valid JSON object matching this schema:
-{{
-  "location": "Settlement Name",
-  "severity": "LOW" | "MODERATE" | "HIGH" | "CRITICAL",
-  "roadStatus": "OPEN" | "AT_RISK" | "BLOCKED",
-  "infrastructure": "Bridge" | "Causeway" | "Road" | "Embankment" | "Drainage",
-  "confidence": float between 0.85 and 0.99
-}}
-"""
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
-            }
-            res = requests.post(url, headers=headers, json=payload, timeout=5)
-            if res.status_code == 200:
-                raw_json = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                parsed = json.loads(raw_json)
-                parsed["source"] = "GEMINI_1_5_FLASH_LIVE"
-                return parsed
-        except Exception as e:
-            print(f"[AI] Gemini API call exception, falling back to local NLP engine: {e}")
 
-    # Deterministic NLP Fallback
+# ---------------------------------------------------------------- extraction
+
+def _settlement_aliases(s: Dict[str, Any]) -> List[str]:
+    name = s["name"].lower()
+    aliases = [name]
+    m = re.match(r"(village \w)\s*\(([^)]+)\)", name)
+    if m:
+        aliases.append(m.group(1))
+        aliases.extend(w for w in re.split(r"\s+", m.group(2)) if len(w) > 3 and w not in ("riverside", "lowlands", "heights", "confluence"))
+    return aliases
+
+
+def match_settlement(text: str, settlements: List[Dict[str, Any]]) -> Dict[str, Any]:
     lower = text.lower()
+    for s in settlements:
+        if s["id"].lower() == lower.strip():
+            return s
+    for s in settlements:
+        for alias in _settlement_aliases(s):
+            if re.search(r"\b" + re.escape(alias) + r"\b", lower):
+                return s
+    return None
 
-    # 1. Location detection
-    detected_loc = "Village A (Wakad)"
-    if "village b" in lower or "sangvi" in lower:
-        detected_loc = "Village B (Sangvi Riverside)"
-    elif "village a" in lower or "wakad" in lower:
-        detected_loc = "Village A (Wakad Khurd)"
-    elif "village c" in lower or "hinjawadi" in lower:
-        detected_loc = "Village C (Hinjawadi Lowlands)"
-    elif "baner" in lower or "village d" in lower:
-        detected_loc = "Village D (Baner Heights)"
-    elif "dapodi" in lower or "village e" in lower:
-        detected_loc = "Village E (Dapodi Confluence)"
-    elif user_location:
-        detected_loc = user_location
 
-    # 2. Road & Infrastructure Status
+def _fallback_extract(text: str, form_location: str, form_severity: str, settlements: List[Dict[str, Any]]) -> Dict[str, Any]:
+    lower = text.lower()
+    target = match_settlement(text, settlements) or match_settlement(form_location, settlements)
+
+    infra = "OTHER"
+    for word, tag in [("bridge", "BRIDGE"), ("causeway", "BRIDGE"), ("embankment", "EMBANKMENT"), ("bund", "EMBANKMENT"),
+                      ("drain", "DRAINAGE"), ("school", "SCHOOL"), ("hospital", "HOSPITAL"), ("house", "HOUSING"),
+                      ("road", "ROAD"), ("street", "ROAD"), ("highway", "ROAD")]:
+        if word in lower:
+            infra = tag
+            break
+
     road_status = "OPEN"
-    infra = "General Street"
-    if "bridge" in lower:
-        infra = "Bridge / Causeway"
-        if "block" in lower or "submerged" in lower or "cut off" in lower or "impassable" in lower:
-            road_status = "BLOCKED"
-        else:
-            road_status = "AT_RISK"
-    elif "causeway" in lower:
-        infra = "River Causeway"
+    if any(w in lower for w in ["blocked", "block", "impassable", "cut off", "washed away", "closed", "submerged road", "collapsed"]):
         road_status = "BLOCKED"
-    elif "road" in lower or "highway" in lower or "street" in lower:
-        infra = "Road Arterial"
-        if "block" in lower or "submerged" in lower or "water" in lower:
-            road_status = "BLOCKED"
-    elif "embankment" in lower or "bund" in lower:
-        infra = "River Embankment"
+    elif any(w in lower for w in ["water on road", "waterlogged", "overflowing", "at risk", "rising"]):
         road_status = "AT_RISK"
 
-    # 3. Severity
-    severity = "HIGH"
-    if "submerged" in lower or "critical" in lower or "entered houses" in lower or "houses" in lower or "trap" in lower:
-        severity = "HIGH"
-    elif "washed away" in lower or "catastrophic" in lower:
+    severity = form_severity.upper() if form_severity and form_severity.upper() in SEVERITIES else "MODERATE"
+    if any(w in lower for w in ["washed away", "trapped", "drowning", "collapsed", "roof"]):
         severity = "CRITICAL"
-    elif "overflow" in lower or "moderate" in lower or "waterlogging" in lower:
-        severity = "MODERATE"
-    elif user_severity:
-        severity = user_severity
+    elif any(w in lower for w in ["entered houses", "entered nearby houses", "into houses", "blocked", "submerged"]) and severity in ("LOW", "MODERATE"):
+        severity = "HIGH"
 
-    confidence = 0.91
-    if "bridge" in lower and "village a" in lower:
-        confidence = 0.94
-
+    signals = sum([target is not None and match_settlement(text, settlements) is not None, infra != "OTHER", road_status != "OPEN"])
     return {
-        "location": detected_loc,
+        "location": target["name"] if target else form_location,
+        "settlementId": target["id"] if target else None,
         "severity": severity,
         "roadStatus": road_status,
         "infrastructure": infra,
-        "confidence": confidence
+        "confidence": round(0.72 + 0.06 * signals, 2),
+        "source": "LOCAL_RULE_PARSER",
     }
 
-def generate_ai_decision_explanation(
-    settlement_name: str,
-    priority_rank: int,
-    risk_score: int,
-    population: int,
-    road_status: str,
-    alternative_route_available: bool,
-    recommended_resource_name: str
-) -> str:
-    """
-    AI Decision Explanation:
-    Automatically generated using Gemini 2.5 Flash if available, strictly based on structured system data.
-    Never invents evidence or values.
-    """
-    access_text = (
-        "remains accessible through the alternative high-ridge bypass route after the primary causeway was blocked"
-        if alternative_route_available
-        else f"is currently {road_status.lower()}"
-    )
 
-    fallback_text = (
-        f"{settlement_name} was designated Priority #{priority_rank} by the decision engine because it exhibits a "
-        f"flood risk score of {risk_score}/100 with {population:,} residents exposed to active flood dynamics. "
-        f"While the primary access route was impacted, the location {access_text}. "
-        f"To mitigate life-safety risk, {recommended_resource_name} was dynamically recommended based on terrain clearance."
-    )
+_extraction_cache: Dict[str, Dict[str, Any]] = {}
 
-    api_key = get_gemini_api_key()
-    if api_key:
+
+def extract_ground_report_info(text: str, form_location: str, form_severity: str, settlements: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cache_key = f"{text}|{form_location}|{form_severity}"
+    if cache_key in _extraction_cache:
+        return dict(_extraction_cache[cache_key])
+    result = _extract(text, form_location, form_severity, settlements)
+    if result["source"].startswith("GEMINI"):
+        _extraction_cache[cache_key] = result
+    return dict(result)
+
+
+def _extract(text: str, form_location: str, form_severity: str, settlements: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if get_gemini_api_key():
         try:
-            prompt = f"""
-You are an expert incident command intelligence officer for ResQGrid.
-Generate a concise, professional 2-sentence operational decision explanation based STRICTLY on these telemetry metrics:
-- Location: {settlement_name}
-- Priority Rank: #{priority_rank}
-- Flood Risk Score: {risk_score}/100
-- Population Exposed: {population:,}
-- Road Status: {road_status}
-- Alternative Route Available: {alternative_route_available}
-- Recommended Resource: {recommended_resource_name}
-
-Rules:
-1. Do not invent any numbers, casualties, or facts not provided.
-2. Focus on why this priority sequencing and resource assignment protects life safety.
-3. Be direct, authoritative, and operational.
-"""
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 100}
+            options = "\n".join(f"- {s['id']}: {s['name']}" for s in settlements)
+            prompt = f"""You extract structured fields from a flood ground report. Do not make decisions.
+Report: "{text}"
+Reporter-selected location: "{form_location}"
+Known settlements:
+{options}
+Return ONLY JSON: {{"settlementId": one of the ids above or null, "severity": {SEVERITIES}, "roadStatus": {ROAD_STATUSES}, "infrastructure": {INFRASTRUCTURE}, "confidence": number 0-1 reflecting how explicit the report is}}"""
+            parsed = json.loads(_gemini(prompt, json_mode=True, timeout=8))
+            for k in ("severity", "roadStatus", "infrastructure"):
+                if isinstance(parsed.get(k), str):
+                    parsed[k] = parsed[k].strip().upper().replace(" ", "_")
+            ids = {s["id"]: s for s in settlements}
+            sid = parsed.get("settlementId")
+            if sid not in ids:
+                fallback_target = match_settlement(form_location, settlements)
+                sid = fallback_target["id"] if fallback_target else None
+            if parsed.get("severity") not in SEVERITIES or parsed.get("roadStatus") not in ROAD_STATUSES:
+                raise ValueError(f"invalid enum in {parsed}")
+            infra = parsed.get("infrastructure")
+            if infra not in INFRASTRUCTURE or infra == "OTHER":
+                # Keyword match is reliable for infrastructure; prefer it over a vague LLM answer
+                infra = _fallback_extract(text, form_location, form_severity, settlements)["infrastructure"]
+            return {
+                "location": ids[sid]["name"] if sid else form_location,
+                "settlementId": sid,
+                "severity": parsed["severity"],
+                "roadStatus": parsed["roadStatus"],
+                "infrastructure": infra,
+                "confidence": round(max(0.0, min(0.99, float(parsed.get("confidence", 0.85)))), 2),
+                "source": f"GEMINI ({GEMINI_MODEL})",
             }
-            res = requests.post(url, headers=headers, json=payload, timeout=3.5)
-            if res.status_code == 200:
-                explanation = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                if explanation:
-                    return explanation
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[AI] Gemini extraction failed, using local parser: {e}")
+    return _fallback_extract(text, form_location, form_severity, settlements)
 
-    return fallback_text
 
+# ---------------------------------------------------------------- explanation
+
+def _numbers(text: str) -> set:
+    return {n.replace(",", "") for n in re.findall(r"\d[\d,]*(?:\.\d+)?", text)}
+
+
+def template_explanation(f: Dict[str, Any]) -> str:
+    parts = [f"{f['settlement']} is priority #{f['priorityRank']} (score {f['priorityScore']}) with {f['riskStatus'].lower()} flood risk of {f['riskScore']}/100"]
+    if f["evidence"]:
+        parts.append("driven by " + ", ".join(e[0].lower() + e[1:] for e in f["evidence"][:3]))
+    text = "; ".join(parts) + ". "
+    text += f"{f['population']:,} people are exposed. "
+    if f["routeStatus"] == "ALTERNATIVE_VALID":
+        text += f"The primary road ({', '.join(f['blockedRoads'])}) is blocked, so {f['resource']} is routed via {', '.join(f['routeRoads'])} (ETA {f['etaMinutes']} min)."
+    elif f["routeStatus"] == "VALID":
+        text += f"{f['resource']} can reach it via {', '.join(f['routeRoads'])} (ETA {f['etaMinutes']} min)."
+    else:
+        text += "No available ground unit can reach it, so escalation to aerial/boat support is required."
+    return text
+
+
+def explain_decision(facts: Dict[str, Any], use_llm: bool = True) -> Dict[str, Any]:
+    fallback = template_explanation(facts)
+    if use_llm and get_gemini_api_key():
+        try:
+            prompt = f"""Rewrite these structured flood-response facts as a clear 2-3 sentence explanation for a response coordinator.
+Rules: use ONLY the facts given; do not add numbers, places, resources, casualties or recommendations that are not in the facts; do not change any value.
+FACTS (JSON): {json.dumps(facts)}"""
+            text = _gemini(prompt, json_mode=False, timeout=8, max_tokens=220)
+            allowed = _numbers(json.dumps(facts)) | {"1", "2", "3"}
+            invented = _numbers(text) - allowed
+            if text and not invented:
+                return {"text": text, "source": f"GEMINI ({GEMINI_MODEL})", "facts": facts, "guard": "PASSED"}
+            print(f"[AI] Explanation rejected, invented numbers: {invented}")
+            return {"text": fallback, "source": "TEMPLATE", "facts": facts, "guard": f"LLM output rejected (unsupported numbers: {', '.join(sorted(invented))})"}
+        except Exception as e:
+            print(f"[AI] Gemini explanation failed, using template: {e}")
+            return {"text": fallback, "source": "TEMPLATE", "facts": facts, "guard": "Gemini unavailable — deterministic template used"}
+    return {"text": fallback, "source": "TEMPLATE", "facts": facts, "guard": "Template (no LLM call)"}
